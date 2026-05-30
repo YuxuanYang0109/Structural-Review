@@ -1495,6 +1495,49 @@ async function askDeskPetAi(plugin, selectedDate, noteContent) {
   return plugin.reportService.callDeepSeek(messages);
 }
 
+function buildSelectionAiMessages(plugin, selectedText, question, sourcePath = "", includeSystemPrompt = true) {
+  const settings = normalizeSettings(plugin.settings);
+  const userMessage = {
+    role: "user",
+    content: [
+      sourcePath ? `Source note: ${sourcePath}` : "",
+      "Selected text:",
+      String(selectedText || "").trim(),
+      "",
+      "User question:",
+      String(question || "").trim() || "请解释这段内容，并给出我接下来可以怎么理解或使用它。",
+    ].filter(Boolean).join("\n"),
+  };
+  if (!includeSystemPrompt) return [userMessage];
+  return [
+    {
+      role: "system",
+      content: [
+        settings.petSystemPrompt,
+        "你正在作为 Obsidian 插件里的桌宠回答用户针对选中文本提出的问题。",
+        "请优先解释选中文本本身，必要时指出可能的上下文缺口。",
+        "默认使用中文，回答清晰、具体、简短；不要编造没有依据的信息。",
+      ].join("\n"),
+    },
+    userMessage,
+  ];
+}
+
+async function askSelectionAi(plugin, selectedText, question, sourcePath = "", includeSystemPrompt = true) {
+  const messages = buildSelectionAiMessages(plugin, selectedText, question, sourcePath, includeSystemPrompt);
+  return plugin.reportService.callDeepSeek(messages);
+}
+
+function openSelectionAiBubble(plugin, selectedText, sourcePath = "") {
+  document.dispatchEvent(new CustomEvent("sr-deskpet-ask", {
+    bubbles: true,
+    detail: {
+      selectedText: String(selectedText || "").trim(),
+      sourcePath: sourcePath || plugin.app.workspace.getActiveFile()?.path || "",
+    },
+  }));
+}
+
 function buildLifeRpgStats(repository, selectedDate) {
   const projects = repository.listProjects();
   const projectMap = new Map(projects.map((project) => [project.id, project]));
@@ -2005,6 +2048,7 @@ function renderDeskPet(root, plugin) {
 
 function renderDeskPetPlatform(root, plugin) {
   const petSize = 92;
+  const isGlobalPet = root === document.body;
   const config = {
     maxWalkDistance: 320,
     maxJumpX: 220,
@@ -2013,6 +2057,9 @@ function renderDeskPetPlatform(root, plugin) {
     landingPointSnapRadius: 110,
     petSpeed: 120,
     jumpDuration: 520,
+    maxLandingPoints: 220,
+    anchorWalkDistance: 250,
+    anchorJumpDistance: 600,
   };
   const sprites = {
     jumpUp: getPluginAssetUrl(plugin, "deskpet-jump-up.png"),
@@ -2024,11 +2071,12 @@ function renderDeskPetPlatform(root, plugin) {
     sleep: getPluginAssetUrl(plugin, "deskpet-sleep.png"),
     held: getPluginAssetUrl(plugin, "deskpet-held.png"),
   };
-  const pet = root.createDiv({ cls: "sr-deskpet" });
+  const pet = root.createDiv({ cls: isGlobalPet ? "sr-deskpet is-global" : "sr-deskpet" });
   pet.setAttr("title", "Shift + double click: toggle platform debug");
   const img = pet.createEl("img", { attr: { alt: "", src: sprites.jumpDown, draggable: "false" } });
   const speechBubble = pet.createDiv({ cls: "sr-deskpet-speech" });
-  const debugLayer = root.createDiv({ cls: "sr-deskpet-debug" });
+  speechBubble.setAttr("tabindex", "-1");
+  const debugLayer = root.createDiv({ cls: isGlobalPet ? "sr-deskpet-debug is-global" : "sr-deskpet-debug" });
 
   let frame = 0;
   let x = 120;
@@ -2046,7 +2094,6 @@ function renderDeskPetPlatform(root, plugin) {
   let idleUntil = 0;
   let settleUntil = 0;
   let settleMoveType = "walk";
-  let speechUntil = 0;
   let freeTargetNodeId = null;
   let freeTargetUntil = 0;
   let debugEnabled = localStorage.getItem("srDeskPetDebug") === "1";
@@ -2056,10 +2103,31 @@ function renderDeskPetPlatform(root, plugin) {
   let dragStartPoint = null;
   let dragOffset = null;
   let isDraggingPet = false;
+  let hoveredPreviewBlock = null;
+  let lastCursorLineElement = null;
+  let anchorTarget = null;
+  let anchorTargetKey = "";
+  let anchorMove = null;
+  let anchorDirty = true;
+  let anchorForceUpdate = true;
+  let anchorTeleportTimer = 0;
+  let scrollPausedUntil = 0;
+  let scrollStopTimer = 0;
+  const scrollStates = new WeakMap();
+  let windowScrollState = { left: window.scrollX || 0, top: window.scrollY || 0 };
+  let activeObserverRoot = null;
 
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
   const distance = (left, right) => Math.hypot(left.x - right.x, left.y - right.y);
   const rootBounds = () => {
+    if (isGlobalPet) {
+      return {
+        rect: { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth, height: window.innerHeight },
+        width: Math.max(petSize, window.innerWidth),
+        height: Math.max(petSize, window.innerHeight),
+        fallbackGround: Math.max(24, window.innerHeight - petSize - 18),
+      };
+    }
     const rect = root.getBoundingClientRect();
     return {
       rect,
@@ -2069,6 +2137,12 @@ function renderDeskPetPlatform(root, plugin) {
     };
   };
   const pointInRoot = (event) => {
+    if (isGlobalPet) {
+      return {
+        x: event.clientX,
+        y: event.clientY,
+      };
+    }
     const rect = root.getBoundingClientRect();
     return {
       x: event.clientX - rect.left + root.scrollLeft,
@@ -2088,6 +2162,11 @@ function renderDeskPetPlatform(root, plugin) {
   const applyPetTransform = () => {
     pet.style.transform = `translate3d(${x}px, ${y}px, 0)`;
   };
+  const clampPetToBounds = () => {
+    const bounds = rootBounds();
+    x = clamp(x, 8, Math.max(8, bounds.width - petSize - 8));
+    y = clamp(y, 24, Math.max(24, bounds.height - petSize - 8));
+  };
   const deskPetMode = () => normalizeSettings(plugin.settings).deskPetMode;
   const setDeskPetMode = async (mode) => {
     plugin.settings.deskPetMode = mode;
@@ -2098,18 +2177,97 @@ function renderDeskPetPlatform(root, plugin) {
     action = "move";
     new Notice(`Desk pet mode: ${mode === "fixed" ? "Fixed" : mode === "free" ? "Free" : "Follow"}`);
   };
-  const showSpeech = (text, duration = 9000) => {
+  const closeSpeech = () => {
+    speechBubble.empty();
+    speechBubble.removeClass("is-visible");
+    speechBubble.removeClass("is-ask");
+    action = "move";
+  };
+  const speechIsOpen = () => speechBubble.hasClass("is-visible");
+  const pauseForSpeech = () => {
+    activeMove = null;
+    freeTargetNodeId = null;
+    freeTargetUntil = 0;
+    action = "speech";
+  };
+  const createSpeechCloseButton = () => {
+    const closeButton = speechBubble.createEl("button", { cls: "sr-deskpet-speech-close", text: "×", type: "button", attr: { "aria-label": "Close" } });
+    closeButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeSpeech();
+    });
+    return closeButton;
+  };
+  const showSpeech = (text) => {
     const value = String(text || "").trim();
     if (!value) return;
-    speechBubble.setText(value.length > 180 ? `${value.slice(0, 180)}...` : value);
+    speechBubble.empty();
+    speechBubble.removeClass("is-ask");
+    pauseForSpeech();
+    createSpeechCloseButton();
+    speechBubble.createDiv({ cls: "sr-deskpet-speech-text", text: value });
     speechBubble.addClass("is-visible");
-    speechUntil = performance.now() + duration;
   };
-  const updateSpeech = (now) => {
-    if (speechUntil && now > speechUntil) {
-      speechUntil = 0;
-      speechBubble.removeClass("is-visible");
-    }
+  const showSelectionAsk = (detail = {}) => {
+    const selectedText = String(detail.selectedText || "").trim();
+    if (!selectedText) return;
+    const sourcePath = String(detail.sourcePath || "");
+    speechBubble.empty();
+    pauseForSpeech();
+    speechBubble.addClass("is-ask");
+    createSpeechCloseButton();
+    speechBubble.createDiv({ cls: "sr-deskpet-speech-title", text: "Ask AI" });
+    if (sourcePath) speechBubble.createDiv({ cls: "sr-deskpet-speech-source", text: sourcePath });
+    speechBubble.createDiv({
+      cls: "sr-deskpet-speech-excerpt",
+      text: selectedText.length > 180 ? `${selectedText.slice(0, 180)}...` : selectedText,
+    });
+    const questionInput = speechBubble.createEl("textarea", { cls: "sr-deskpet-speech-question" });
+    questionInput.rows = 3;
+    questionInput.placeholder = "想问什么？";
+    const option = speechBubble.createEl("label", { cls: "sr-deskpet-speech-option" });
+    const systemInput = option.createEl("input", { type: "checkbox" });
+    systemInput.checked = true;
+    option.createSpan({ text: "Send system prompt" });
+    const answerBox = speechBubble.createDiv({ cls: "sr-deskpet-speech-answer" });
+    const actions = speechBubble.createDiv({ cls: "sr-deskpet-speech-actions" });
+    const sendButton = actions.createEl("button", { text: "Send", type: "button" });
+    sendButton.addClass("mod-cta");
+    const send = async () => {
+      sendButton.disabled = true;
+      sendButton.setText("Thinking...");
+      answerBox.setText("Thinking...");
+      try {
+        const answer = await askSelectionAi(plugin, selectedText, questionInput.value, sourcePath, systemInput.checked);
+        answerBox.setText(answer);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to ask AI.";
+        answerBox.setText(message);
+        new Notice(message);
+      } finally {
+        sendButton.disabled = false;
+        sendButton.setText("Send");
+      }
+    };
+    sendButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void send();
+    });
+    questionInput.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeSpeech();
+        return;
+      }
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        void send();
+      }
+    });
+    speechBubble.addClass("is-visible");
+    window.setTimeout(() => questionInput.focus(), 0);
   };
   const showModeMenu = (event) => {
     event.preventDefault();
@@ -2133,14 +2291,167 @@ function renderDeskPetPlatform(root, plugin) {
     graphDirty = true;
     debugRenderKey = "";
   };
+  let graphDirtyTimer = 0;
+  const scheduleGraphDirty = () => {
+    if (graphDirtyTimer) window.clearTimeout(graphDirtyTimer);
+    graphDirtyTimer = window.setTimeout(() => {
+      graphDirtyTimer = 0;
+      markGraphDirty();
+    }, 100);
+  };
+  const handleSurfaceChanged = () => {
+    currentNodeId = null;
+    activeMove = null;
+    anchorMove = null;
+    anchorTarget = null;
+    anchorTargetKey = "";
+    hoveredPreviewBlock = null;
+    lastCursorLineElement = null;
+    anchorDirty = true;
+    anchorForceUpdate = true;
+    freeTargetNodeId = null;
+    freeTargetUntil = 0;
+    rememberActiveScrollStates();
+    scheduleGraphDirty();
+  };
+  const carryPetByScroll = (deltaLeft, deltaTop) => {
+    if (!isGlobalPet || isDraggingPet || (!deltaLeft && !deltaTop)) return;
+    x -= deltaLeft;
+    y -= deltaTop;
+    if (activeMove) {
+      activeMove.from = { ...activeMove.from, x: activeMove.from.x - deltaLeft, y: activeMove.from.y - deltaTop };
+      activeMove.to = { ...activeMove.to, x: activeMove.to.x - deltaLeft, y: activeMove.to.y - deltaTop };
+    }
+    currentNodeId = null;
+    clampPetToBounds();
+    applyPetTransform();
+  };
+  const handleScroll = (event) => {
+    scheduleGraphDirty();
+    if (!isGlobalPet) return;
+    if (getMarkdownAnchorSurface()) {
+      activeMove = null;
+      anchorMove = null;
+      scrollPausedUntil = Infinity;
+      if (scrollStopTimer) window.clearTimeout(scrollStopTimer);
+      scrollStopTimer = window.setTimeout(() => {
+        scrollPausedUntil = 0;
+        anchorDirty = true;
+        anchorForceUpdate = true;
+      }, 200);
+      return;
+    }
+    const target = event.target;
+    if (target === document || target === window || target === document.documentElement || target === document.body) {
+      const next = { left: window.scrollX || 0, top: window.scrollY || 0 };
+      carryPetByScroll(next.left - windowScrollState.left, next.top - windowScrollState.top);
+      windowScrollState = next;
+      return;
+    }
+    if (!(target instanceof Element)) return;
+    const previous = scrollStates.get(target);
+    const next = { left: target.scrollLeft || 0, top: target.scrollTop || 0 };
+    if (previous) {
+      carryPetByScroll(next.left - previous.left, next.top - previous.top);
+    }
+    scrollStates.set(target, next);
+  };
   const isVisibleRect = (rect, rootRect) => {
-    if (rect.width < 18 || rect.height < 18) return false;
+    if (rect.width < 18 || rect.height < 12) return false;
+    if (isGlobalPet) {
+      return rect.right >= 0 && rect.left <= window.innerWidth && rect.bottom >= 0 && rect.top <= window.innerHeight;
+    }
     return rect.right >= rootRect.left - 80 && rect.left <= rootRect.right + 80;
   };
   const classLabel = (element) => Array.from(element?.classList || []).slice(0, 3).join(".");
+  const getActiveSurfaceRoot = () => {
+    const activeContainer = plugin.app?.workspace?.activeLeaf?.view?.containerEl;
+    if (activeContainer instanceof Element) return activeContainer;
+    return root;
+  };
+  const markdownBlockSelector = ".markdown-preview-view h1, .markdown-preview-view h2, .markdown-preview-view h3, .markdown-preview-view h4, .markdown-preview-view p, .markdown-preview-view li, .markdown-preview-view blockquote, .markdown-preview-view pre, .markdown-preview-view table, .markdown-preview-view img";
+  const getMarkdownAnchorSurface = () => {
+    if (!isGlobalPet) return null;
+    const surfaceRoot = getActiveSurfaceRoot();
+    if (!(surfaceRoot instanceof Element) || surfaceRoot.querySelector(".structured-review-view")) return null;
+    const editor = surfaceRoot.querySelector(".cm-editor");
+    if (editor instanceof Element) {
+      return {
+        mode: "edit",
+        root: surfaceRoot,
+        editor,
+        container: editor.querySelector(".cm-scroller") || editor,
+      };
+    }
+    const preview = surfaceRoot.querySelector(".markdown-preview-view");
+    if (preview instanceof Element) {
+      return { mode: "preview", root: surfaceRoot, preview, container: preview };
+    }
+    return null;
+  };
+  const currentCursorLine = (surface) => {
+    if (!surface?.editor) return null;
+    const active = surface.editor.querySelector(".cm-line.cm-active, .cm-line.cm-activeLine, .cm-activeLine");
+    const activeLine = active?.closest?.(".cm-line");
+    if (activeLine instanceof Element) return activeLine;
+    const selection = window.getSelection();
+    const anchor = selection?.anchorNode instanceof Element ? selection.anchorNode : selection?.anchorNode?.parentElement;
+    const line = anchor?.closest?.(".cm-line");
+    return line instanceof Element && surface.editor.contains(line) ? line : null;
+  };
+  const anchorFromElement = (element, container, keyPrefix) => {
+    if (!(element instanceof Element) || !(container instanceof Element)) return null;
+    const rect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    if (rect.width < 18 || rect.height < 8 || rect.bottom < 0 || rect.top > window.innerHeight) return null;
+    const minX = Math.max(8, containerRect.left + 8);
+    const maxX = Math.min(window.innerWidth - petSize - 8, containerRect.right - petSize - 12);
+    const targetX = clamp(Math.min(rect.right + 12, maxX), minX, Math.max(minX, window.innerWidth - petSize - 8));
+    const targetY = clamp(rect.top + rect.height / 2 - petSize / 2, 24, Math.max(24, window.innerHeight - petSize - 8));
+    return {
+      x: targetX,
+      y: targetY,
+      key: `${keyPrefix}:${Math.round(rect.top)}:${Math.round(rect.left)}:${Math.round(rect.width)}:${Math.round(rect.height)}`,
+      element,
+    };
+  };
+  const getMutationRoot = () => {
+    const surfaceRoot = getActiveSurfaceRoot();
+    return surfaceRoot instanceof Element ? surfaceRoot : root;
+  };
+  const rememberScrollState = (element) => {
+    if (!(element instanceof Element) || scrollStates.has(element)) return;
+    scrollStates.set(element, { left: element.scrollLeft || 0, top: element.scrollTop || 0 });
+  };
+  const rememberActiveScrollStates = () => {
+    windowScrollState = { left: window.scrollX || 0, top: window.scrollY || 0 };
+    const surfaceRoot = getActiveSurfaceRoot();
+    if (!(surfaceRoot instanceof Element)) return;
+    rememberScrollState(surfaceRoot);
+    surfaceRoot.querySelectorAll(".markdown-preview-view, .cm-scroller, .workspace-leaf-content, .structured-review-view").forEach(rememberScrollState);
+  };
+  const observeActiveSurface = (observer) => {
+    const nextRoot = isGlobalPet ? getMutationRoot() : root;
+    if (!(nextRoot instanceof Element) || nextRoot === activeObserverRoot) return;
+    observer.disconnect();
+    activeObserverRoot = nextRoot;
+    observer.observe(nextRoot, { childList: true, subtree: true, characterData: true });
+  };
+  const platformTypeForElement = (element) => {
+    const tag = element.tagName?.toLowerCase() || "";
+    if (/^h[1-4]$/.test(tag)) return "heading";
+    if (tag === "p") return "paragraph";
+    if (tag === "li") return "list";
+    if (tag === "blockquote") return "quote";
+    if (tag === "pre") return "code";
+    if (tag === "table") return "table";
+    if (tag === "img") return "image";
+    return tag || "block";
+  };
   const collectLandingPoints = () => {
     const bounds = rootBounds();
-    const rootRect = root.getBoundingClientRect();
+    const rootRect = isGlobalPet ? { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight } : root.getBoundingClientRect();
+    const surfaceRoot = getActiveSurfaceRoot();
     const points = [];
     const addPoint = (px, py, type, element = null) => {
       const point = {
@@ -2152,13 +2463,17 @@ function renderDeskPetPlatform(root, plugin) {
       };
       if (Number.isFinite(point.x) && Number.isFinite(point.y)) points.push(point);
     };
-    const topY = (rect) => rect.top - rootRect.top + root.scrollTop - petSize + 2;
-    const bottomY = (rect) => rect.bottom - rootRect.top + root.scrollTop - petSize + 2;
+    const toLocalLeft = (rect) => isGlobalPet ? rect.left : rect.left - rootRect.left + root.scrollLeft;
+    const toLocalRight = (rect) => isGlobalPet ? rect.right : rect.right - rootRect.left + root.scrollLeft;
+    const toLocalTop = (rect) => isGlobalPet ? rect.top : rect.top - rootRect.top + root.scrollTop;
+    const toLocalBottom = (rect) => isGlobalPet ? rect.bottom : rect.bottom - rootRect.top + root.scrollTop;
+    const topY = (rect) => toLocalTop(rect) - petSize + 2;
+    const bottomY = (rect) => toLocalBottom(rect) - petSize + 2;
     const addTopEdge = (element, type, inset = 16) => {
       const rect = element.getBoundingClientRect();
       if (!isVisibleRect(rect, rootRect)) return;
-      const left = rect.left - rootRect.left + root.scrollLeft;
-      const right = rect.right - rootRect.left + root.scrollLeft;
+      const left = toLocalLeft(rect);
+      const right = toLocalRight(rect);
       const minX = left + inset;
       const maxX = Math.max(minX, right - petSize - inset);
       addPoint(minX, topY(rect), type, element);
@@ -2168,12 +2483,12 @@ function renderDeskPetPlatform(root, plugin) {
     const addBottom = (element, type) => {
       const rect = element.getBoundingClientRect();
       if (!isVisibleRect(rect, rootRect)) return;
-      const left = rect.left - rootRect.left + root.scrollLeft;
-      const right = rect.right - rootRect.left + root.scrollLeft;
+      const left = toLocalLeft(rect);
+      const right = toLocalRight(rect);
       addPoint((left + right - petSize) / 2, bottomY(rect), type, element);
     };
 
-    root.querySelectorAll([
+    surfaceRoot.querySelectorAll([
       ".sr-overview-hero",
       ".sr-overview-trend-panel",
       ".sr-calendar-panel",
@@ -2182,7 +2497,7 @@ function renderDeskPetPlatform(root, plugin) {
       ".sr-panel",
     ].join(",")).forEach((element) => addTopEdge(element, "panel-top", 18));
 
-    root.querySelectorAll([
+    surfaceRoot.querySelectorAll([
       ".sr-project-card",
       ".sr-overview-card",
       ".sr-stat-card",
@@ -2194,24 +2509,52 @@ function renderDeskPetPlatform(root, plugin) {
       addBottom(element, "card-bottom");
     });
 
-    root.querySelectorAll(".sr-calendar-day").forEach((element) => {
+    surfaceRoot.querySelectorAll(".sr-calendar-day").forEach((element) => {
       const rect = element.getBoundingClientRect();
       if (!isVisibleRect(rect, rootRect)) return;
-      const left = rect.left - rootRect.left + root.scrollLeft;
-      const right = rect.right - rootRect.left + root.scrollLeft;
-      const top = rect.top - rootRect.top + root.scrollTop;
-      const bottom = rect.bottom - rootRect.top + root.scrollTop;
+      const left = toLocalLeft(rect);
+      const right = toLocalRight(rect);
+      const top = toLocalTop(rect);
+      const bottom = toLocalBottom(rect);
       addPoint(left + 8, top - petSize + 2, "calendar-top-left", element);
       addPoint((left + right - petSize) / 2, top - petSize + 2, "calendar-top-center", element);
       addPoint((left + right - petSize) / 2, bottom - petSize - 8, "calendar-bottom-bar", element);
     });
 
-    root.querySelectorAll(".sr-calendar-bar, .sr-calendar-temp-pill").forEach((element) => {
+    surfaceRoot.querySelectorAll(".sr-calendar-bar, .sr-calendar-temp-pill").forEach((element) => {
       const rect = element.getBoundingClientRect();
       if (!isVisibleRect(rect, rootRect)) return;
-      const left = rect.left - rootRect.left + root.scrollLeft;
-      const right = rect.right - rootRect.left + root.scrollLeft;
+      const left = toLocalLeft(rect);
+      const right = toLocalRight(rect);
       addPoint((left + right - petSize) / 2, topY(rect), "calendar-project-bar", element);
+    });
+
+    surfaceRoot.querySelectorAll(".markdown-preview-view h1, .markdown-preview-view h2, .markdown-preview-view h3, .markdown-preview-view h4, .markdown-preview-view p, .markdown-preview-view li, .markdown-preview-view blockquote, .markdown-preview-view pre, .markdown-preview-view table, .markdown-preview-view img").forEach((element) => {
+      const rect = element.getBoundingClientRect();
+      if (!isVisibleRect(rect, rootRect) || rect.width < 40 || rect.height < 12) return;
+      const left = toLocalLeft(rect);
+      const right = toLocalRight(rect);
+      const type = platformTypeForElement(element);
+      addPoint((left + right - petSize) / 2, topY(rect), type, element);
+      if (rect.height >= 48) {
+        addPoint(right - petSize - 8, bottomY(rect), `${type}-bottom`, element);
+      }
+    });
+
+    const visibleLines = Array.from(surfaceRoot.querySelectorAll(".cm-editor .cm-line")).filter((element) => {
+      const rect = element.getBoundingClientRect();
+      if (!isVisibleRect(rect, rootRect) || rect.width < 40 || rect.height < 12) return false;
+      const text = element.textContent || "";
+      if (text.trim()) return true;
+      if (!mouseTarget) return false;
+      return Math.abs((toLocalTop(rect) + toLocalBottom(rect)) / 2 - mouseTarget.y) <= 80;
+    });
+    visibleLines.forEach((element, index) => {
+      if (index % 3 !== 0) return;
+      const rect = element.getBoundingClientRect();
+      const left = toLocalLeft(rect);
+      const right = toLocalRight(rect);
+      addPoint((left + right - petSize) / 2, topY(rect), "cm-line", element);
     });
 
     const groundColumns = 6;
@@ -2228,6 +2571,7 @@ function renderDeskPetPlatform(root, plugin) {
       seen.add(key);
       point.id = `p${unique.length}`;
       unique.push(point);
+      if (unique.length >= config.maxLandingPoints) break;
     }
     return unique;
   };
@@ -2376,8 +2720,8 @@ function renderDeskPetPlatform(root, plugin) {
     debugLayer.toggleClass("is-enabled", debugEnabled);
     if (!debugEnabled || !graph) return;
     const bounds = rootBounds();
-    const width = Math.max(bounds.width, root.scrollWidth);
-    const height = Math.max(bounds.height, root.scrollHeight);
+    const width = isGlobalPet ? bounds.width : Math.max(bounds.width, root.scrollWidth);
+    const height = isGlobalPet ? bounds.height : Math.max(bounds.height, root.scrollHeight);
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("width", String(width));
     svg.setAttribute("height", String(height));
@@ -2405,10 +2749,22 @@ function renderDeskPetPlatform(root, plugin) {
       dot.setAttribute("class", node.id === targetNodeId ? "sr-deskpet-debug-node is-target" : "sr-deskpet-debug-node");
       svg.appendChild(dot);
     }
+    for (const node of graph.nodes) {
+      const label = debugLayer.createDiv({ cls: node.id === targetNodeId ? "sr-deskpet-debug-label is-target" : "sr-deskpet-debug-label", text: node.type });
+      label.style.transform = `translate3d(${Math.round(node.x + petSize / 2 + 5)}px, ${Math.round(node.y + petSize - 9)}px, 0)`;
+    }
   };
   const setMouseTarget = (event) => {
     if (isDraggingPet) return;
     mouseTarget = pointInRoot(event);
+    const surface = getMarkdownAnchorSurface();
+    if (surface?.mode !== "preview") return;
+    const target = event.target instanceof Element ? event.target : null;
+    const block = target?.closest?.(markdownBlockSelector);
+    if (block instanceof Element && surface.preview.contains(block) && block !== hoveredPreviewBlock) {
+      hoveredPreviewBlock = block;
+      anchorDirty = true;
+    }
   };
   const startIdle = (now) => {
     const choices = ["read", "game", "sleep"];
@@ -2463,6 +2819,123 @@ function renderDeskPetPlatform(root, plugin) {
     applyPetTransform();
     return true;
   };
+  const updateAnchorTarget = (surface) => {
+    if (!surface) return null;
+    if (surface.mode === "edit") {
+      const line = currentCursorLine(surface);
+      if (!line) return anchorTarget;
+      const lineChanged = line !== lastCursorLineElement;
+      if (lineChanged) {
+        lastCursorLineElement = line;
+        anchorDirty = true;
+      }
+      if (!lineChanged && anchorTarget && !anchorForceUpdate) return anchorTarget;
+      const target = anchorFromElement(line, surface.container, "edit-line");
+      if (target) {
+        anchorTarget = target;
+        anchorTargetKey = target.key;
+        anchorDirty = false;
+        anchorForceUpdate = false;
+      }
+      return anchorTarget;
+    }
+    if (surface.mode === "preview") {
+      if (!(hoveredPreviewBlock instanceof Element) || !surface.preview.contains(hoveredPreviewBlock)) return anchorTarget;
+      if (!anchorDirty && !anchorForceUpdate && anchorTarget) return anchorTarget;
+      const target = anchorFromElement(hoveredPreviewBlock, surface.container, "preview-block");
+      if (target) {
+        anchorTarget = target;
+        anchorTargetKey = target.key;
+        anchorDirty = false;
+        anchorForceUpdate = false;
+      }
+      return anchorTarget;
+    }
+    return null;
+  };
+  const startAnchorMove = (target, now) => {
+    if (!target) return;
+    const moveDistance = distance({ x, y }, target);
+    if (moveDistance < 6) {
+      x = target.x;
+      y = target.y;
+      applyPetTransform();
+      anchorMove = null;
+      return;
+    }
+    direction = target.x >= x ? 1 : -1;
+    if (moveDistance > config.anchorJumpDistance) {
+      if (anchorTeleportTimer) return;
+      anchorMove = null;
+      pet.addClass("is-fading");
+      anchorTeleportTimer = window.setTimeout(() => {
+        x = target.x;
+        y = target.y;
+        applyPetTransform();
+        pet.removeClass("is-fading");
+        anchorTeleportTimer = 0;
+      }, 140);
+      return;
+    }
+    const type = moveDistance < config.anchorWalkDistance ? "walk" : "jump";
+    anchorMove = {
+      start: now,
+      duration: type === "walk" ? Math.max(220, (moveDistance / 150) * 1000) : 420,
+      from: { x, y },
+      to: { x: target.x, y: target.y },
+      type,
+      arc: type === "jump" ? clamp(72 + Math.abs(target.y - y) * 0.25, 76, 130) : 0,
+    };
+    action = type;
+  };
+  const updateAnchorMovement = (now) => {
+    if (!anchorMove) return false;
+    const progress = clamp((now - anchorMove.start) / anchorMove.duration, 0, 1);
+    x = anchorMove.from.x + (anchorMove.to.x - anchorMove.from.x) * progress;
+    y = anchorMove.from.y + (anchorMove.to.y - anchorMove.from.y) * progress;
+    if (anchorMove.type === "jump") {
+      y -= Math.sin(progress * Math.PI) * anchorMove.arc;
+      const jumpFrame = Math.min(3, Math.floor(progress * 4));
+      setImagePose(["jumpUp", "jumpUp", "jumpDown", "jumpDown"][jumpFrame], direction, 0, [-3, -1, 2, 3][jumpFrame]);
+    } else {
+      const walkFrame = Math.floor(now / 190) % 4;
+      setImagePose(["walkA", "walkA", "walkB", "walkB"][walkFrame], direction, [0, -1.1, -0.4, -1.3][walkFrame], [-0.8, 0, 0.8, 0][walkFrame]);
+    }
+    if (progress >= 1) {
+      x = anchorMove.to.x;
+      y = anchorMove.to.y;
+      anchorMove = null;
+      action = "anchor";
+    }
+    applyPetTransform();
+    return true;
+  };
+  const tickAnchorMode = (surface, now) => {
+    activeMove = null;
+    currentNodeId = null;
+    targetNodeId = null;
+    debugLayer.empty();
+    if (isDraggingPet || speechIsOpen()) return false;
+    if (now < scrollPausedUntil) {
+      setImagePose("read", direction, 0, 0);
+      applyPetTransform();
+      return true;
+    }
+    const target = updateAnchorTarget(surface);
+    if (!target) {
+      setImagePose("read", direction, Math.sin(now / 420) * -0.8, 0);
+      applyPetTransform();
+      return true;
+    }
+    if (updateAnchorMovement(now)) return true;
+    if (distance({ x, y }, target) > 8) {
+      startAnchorMove(target, now);
+      return true;
+    }
+    setImagePose("read", direction, Math.sin(now / 420) * -0.8, 0);
+    applyPetTransform();
+    return true;
+  };
   const syncToNearestNode = () => {
     const currentGraph = getGraph();
     if (!currentGraph.nodes.length) return null;
@@ -2484,8 +2957,9 @@ function renderDeskPetPlatform(root, plugin) {
     if (!isDraggingPet || event.pointerId !== dragPointerId || !dragOffset) return;
     const point = pointInRoot(event);
     direction = point.x >= x + petSize / 2 ? 1 : -1;
-    x = clamp(point.x - dragOffset.x, 8, Math.max(8, root.scrollWidth - petSize - 8));
-    y = clamp(point.y - dragOffset.y, 24, Math.max(24, root.scrollHeight - petSize - 8));
+    const bounds = rootBounds();
+    x = clamp(point.x - dragOffset.x, 8, Math.max(8, bounds.width - petSize - 8));
+    y = clamp(point.y - dragOffset.y, 24, Math.max(24, bounds.height - petSize - 8));
     setImagePose("held", direction, Math.sin(performance.now() / 180) * 1.5, Math.sin(performance.now() / 230) * 2.5);
     applyPetTransform();
   };
@@ -2503,13 +2977,18 @@ function renderDeskPetPlatform(root, plugin) {
     clearDragHold();
     if (isDraggingPet) {
       updateDraggedPet(event);
-      const currentGraph = getGraph();
-      const drop = nearestNode({ x, y }, currentGraph);
-      if (drop) {
-        x = drop.x;
-        y = drop.y;
-        currentNodeId = drop.id;
-        applyPetTransform();
+      if (getMarkdownAnchorSurface()) {
+        anchorDirty = true;
+        anchorForceUpdate = true;
+      } else {
+        const currentGraph = getGraph();
+        const drop = nearestNode({ x, y }, currentGraph);
+        if (drop) {
+          x = drop.x;
+          y = drop.y;
+          currentNodeId = drop.id;
+          applyPetTransform();
+        }
       }
     }
     isDraggingPet = false;
@@ -2555,16 +3034,41 @@ function renderDeskPetPlatform(root, plugin) {
   };
   const handlePetSpeech = (event) => {
     showSpeech(event.detail?.text || "");
+    if (speechBubble.hasClass("is-visible")) window.setTimeout(() => speechBubble.focus(), 0);
+  };
+  const handlePetAsk = (event) => {
+    showSelectionAsk(event.detail || {});
+  };
+  const handleSpeechKeydown = (event) => {
+    if (!speechIsOpen() || event.key !== "Escape") return;
+    event.preventDefault();
+    closeSpeech();
+  };
+  const handleAnchorRefresh = () => {
+    if (getMarkdownAnchorSurface()) anchorDirty = true;
   };
   const tick = (now = performance.now()) => {
-    updateSpeech(now);
-    const currentGraph = getGraph();
-    if (!currentGraph.nodes.length) {
+    if (isDraggingPet) {
+      setImagePose("held", direction, Math.sin(now / 180) * 1.5, Math.sin(now / 230) * 2.5);
       frame = requestAnimationFrame(tick);
       return;
     }
-    if (isDraggingPet) {
-      setImagePose("held", direction, Math.sin(now / 180) * 1.5, Math.sin(now / 230) * 2.5);
+    if (speechIsOpen()) {
+      activeMove = null;
+      anchorMove = null;
+      setImagePose("read", direction, 0, 0);
+      applyPetTransform();
+      frame = requestAnimationFrame(tick);
+      return;
+    }
+    const markdownSurface = getMarkdownAnchorSurface();
+    if (markdownSurface) {
+      tickAnchorMode(markdownSurface, now);
+      frame = requestAnimationFrame(tick);
+      return;
+    }
+    const currentGraph = getGraph();
+    if (!currentGraph.nodes.length) {
       frame = requestAnimationFrame(tick);
       return;
     }
@@ -2585,8 +3089,8 @@ function renderDeskPetPlatform(root, plugin) {
       nextTarget = chooseFreeTarget(currentNode.id, now, currentGraph);
     } else {
       const targetPoint = mouseTarget || {
-        x: root.scrollLeft + rootBounds().width * 0.55,
-        y: root.scrollTop + rootBounds().rect.height * 0.45,
+        x: rootBounds().width * 0.55,
+        y: rootBounds().rect.height * 0.45,
       };
       nextTarget = nearestTargetNode(targetPoint, currentGraph);
     }
@@ -2622,50 +3126,80 @@ function renderDeskPetPlatform(root, plugin) {
     frame = requestAnimationFrame(tick);
   };
 
-  root.addEventListener("pointermove", setMouseTarget);
-  root.addEventListener("sr-deskpet-say", handlePetSpeech);
+  const pointerSurface = isGlobalPet ? document : root;
+  const speechSurface = isGlobalPet ? document : root;
+  rememberActiveScrollStates();
+  ["pointerdown", "click", "dblclick", "contextmenu"].forEach((eventName) => {
+    speechBubble.addEventListener(eventName, (event) => event.stopPropagation());
+  });
+  pointerSurface.addEventListener("pointermove", setMouseTarget);
+  speechSurface.addEventListener("sr-deskpet-say", handlePetSpeech);
+  speechSurface.addEventListener("sr-deskpet-ask", handlePetAsk);
+  document.addEventListener("keydown", handleSpeechKeydown);
+  document.addEventListener("selectionchange", handleAnchorRefresh);
+  document.addEventListener("keyup", handleAnchorRefresh);
+  document.addEventListener("click", handleAnchorRefresh, true);
   pet.addEventListener("pointerdown", handlePetPointerDown);
   pet.addEventListener("contextmenu", showModeMenu);
   pet.addEventListener("dblclick", handleDebugToggle);
   window.addEventListener("pointermove", handleDragPointerMove);
   window.addEventListener("pointerup", finishPetDrag);
   window.addEventListener("pointercancel", cancelPetDrag);
-  window.addEventListener("resize", markGraphDirty);
+  window.addEventListener("resize", scheduleGraphDirty);
+  window.addEventListener("scroll", handleScroll, true);
   const observer = new MutationObserver((mutations) => {
     const hasContentMutation = mutations.some((mutation) => {
-      const target = mutation.target instanceof Element ? mutation.target : null;
+      const target = mutation.target instanceof Element ? mutation.target : mutation.target?.parentElement;
       if (target?.closest(".sr-deskpet, .sr-deskpet-debug")) return false;
+      if (mutation.type === "characterData") return true;
       return Array.from(mutation.addedNodes || []).concat(Array.from(mutation.removedNodes || [])).some((node) => {
-        if (!(node instanceof Element)) return false;
-        return !node.closest(".sr-deskpet, .sr-deskpet-debug");
+        const element = node instanceof Element ? node : node?.parentElement;
+        if (!(element instanceof Element)) return false;
+        return !element.closest(".sr-deskpet, .sr-deskpet-debug");
       });
     });
-    if (hasContentMutation) markGraphDirty();
+    if (hasContentMutation) scheduleGraphDirty();
   });
-  observer.observe(root, { childList: true, subtree: true });
+  const activeLeafRef = plugin.app?.workspace?.on ? plugin.app.workspace.on("active-leaf-change", () => {
+    handleSurfaceChanged();
+    observeActiveSurface(observer);
+  }) : null;
+  observeActiveSurface(observer);
 
-  const initialNode = nearestNode({ x, y }, getGraph());
-  if (initialNode) {
-    currentNodeId = initialNode.id;
-    x = initialNode.x;
-    y = initialNode.y;
-    applyPetTransform();
+  if (!getMarkdownAnchorSurface()) {
+    const initialNode = nearestNode({ x, y }, getGraph());
+    if (initialNode) {
+      currentNodeId = initialNode.id;
+      x = initialNode.x;
+      y = initialNode.y;
+      applyPetTransform();
+    }
   }
   frame = requestAnimationFrame(tick);
 
   return () => {
     if (frame) cancelAnimationFrame(frame);
     clearDragHold();
+    if (graphDirtyTimer) window.clearTimeout(graphDirtyTimer);
+    if (scrollStopTimer) window.clearTimeout(scrollStopTimer);
+    if (anchorTeleportTimer) window.clearTimeout(anchorTeleportTimer);
     observer.disconnect();
-    root.removeEventListener("pointermove", setMouseTarget);
-    root.removeEventListener("sr-deskpet-say", handlePetSpeech);
+    if (activeLeafRef && plugin.app?.workspace?.offref) plugin.app.workspace.offref(activeLeafRef);
+    pointerSurface.removeEventListener("pointermove", setMouseTarget);
+    speechSurface.removeEventListener("sr-deskpet-say", handlePetSpeech);
+    speechSurface.removeEventListener("sr-deskpet-ask", handlePetAsk);
+    document.removeEventListener("keydown", handleSpeechKeydown);
+    document.removeEventListener("selectionchange", handleAnchorRefresh);
+    document.removeEventListener("keyup", handleAnchorRefresh);
+    document.removeEventListener("click", handleAnchorRefresh, true);
     pet.removeEventListener("pointerdown", handlePetPointerDown);
     pet.removeEventListener("contextmenu", showModeMenu);
     pet.removeEventListener("dblclick", handleDebugToggle);
     window.removeEventListener("pointermove", handleDragPointerMove);
     window.removeEventListener("pointerup", finishPetDrag);
     window.removeEventListener("pointercancel", cancelPetDrag);
-    window.removeEventListener("resize", markGraphDirty);
+    window.removeEventListener("resize", scheduleGraphDirty);
+    window.removeEventListener("scroll", handleScroll, true);
     debugLayer.remove();
     pet.remove();
   };
@@ -4644,6 +5178,89 @@ function confirmReportPrompt(app, title, message, confirmText) {
   });
 }
 
+class SelectionAiModal extends Modal {
+  constructor(app, plugin, selectedText, sourcePath = "") {
+    super(app);
+    this.plugin = plugin;
+    this.selectedText = String(selectedText || "").trim();
+    this.sourcePath = sourcePath || "";
+    this.answer = "";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("sr-selection-ai-modal");
+    contentEl.createEl("h2", { text: "Ask AI" });
+    if (this.sourcePath) contentEl.createDiv({ cls: "sr-muted", text: this.sourcePath });
+
+    const form = contentEl.createDiv({ cls: "sr-form" });
+    const selectedRow = form.createDiv({ cls: "sr-form-row" });
+    selectedRow.createEl("label", { text: "Selected text" });
+    const selectedBox = selectedRow.createEl("textarea");
+    selectedBox.rows = 6;
+    selectedBox.value = this.selectedText;
+    selectedBox.readOnly = true;
+
+    const questionRow = form.createDiv({ cls: "sr-form-row" });
+    questionRow.createEl("label", { text: "Question" });
+    const questionInput = questionRow.createEl("textarea");
+    questionInput.rows = 3;
+    questionInput.placeholder = "解释这段话 / 总结重点 / 告诉我怎么理解";
+
+    const answerWrap = form.createDiv({ cls: "sr-selection-ai-answer" });
+    if (this.answer) answerWrap.setText(this.answer);
+
+    const actions = form.createDiv({ cls: "sr-entry-actions" });
+    const askButton = actions.createEl("button", { text: "Send to AI", type: "button" });
+    askButton.addClass("mod-cta");
+    actions.createEl("button", { text: "Close", type: "button" }).addEventListener("click", () => this.close());
+
+    const send = async () => {
+      if (!this.selectedText) {
+        new Notice("No selected text.");
+        return;
+      }
+      askButton.disabled = true;
+      askButton.setText("Thinking...");
+      answerWrap.setText("Thinking...");
+      try {
+        const answer = await askSelectionAi(this.plugin, this.selectedText, questionInput.value, this.sourcePath);
+        this.answer = answer;
+        answerWrap.setText(answer);
+        document.dispatchEvent(new CustomEvent("sr-deskpet-say", {
+          bubbles: true,
+          detail: { text: answer },
+        }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to ask AI.";
+        answerWrap.setText(message);
+        new Notice(message);
+        document.dispatchEvent(new CustomEvent("sr-deskpet-say", {
+          bubbles: true,
+          detail: { text: message },
+        }));
+      } finally {
+        askButton.disabled = false;
+        askButton.setText("Send to AI");
+      }
+    };
+
+    askButton.addEventListener("click", send);
+    questionInput.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        void send();
+      }
+    });
+    window.setTimeout(() => questionInput.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class ReportSettingsModal extends Modal {
   constructor(app, plugin) {
     super(app);
@@ -4877,7 +5494,6 @@ class StructuredReviewView extends ItemView {
     } else {
       renderProjectDetails(right, this.plugin, this.plugin.repository.getProject(this.selectedProjectId), this);
     }
-    this.deskPetCleanup = renderDeskPetPlatform(root, this.plugin);
   }
 }
 
@@ -4918,6 +5534,39 @@ module.exports = class StructuredReviewPlugin extends Plugin {
       callback: () => new ReportSettingsModal(this.app, this).open(),
     });
 
+    this.registerEvent(this.app.workspace.on("editor-menu", (menu, editor, view) => {
+      const selectedText = String(editor?.getSelection?.() || "").trim();
+      if (!selectedText) return;
+      const sourcePath = view?.file?.path || this.app.workspace.getActiveFile()?.path || "";
+      menu.addItem((item) => {
+        item.setTitle("Ask AI / 提问 AI")
+          .setIcon("sparkles")
+          .onClick(() => openSelectionAiBubble(this, selectedText, sourcePath));
+      });
+    }));
+
+    this.registerDomEvent(document, "contextmenu", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || target.closest(".cm-editor, input, textarea")) return;
+      const preview = target.closest(".markdown-preview-view");
+      if (!preview) return;
+      const selection = window.getSelection();
+      const selectedText = String(selection?.toString() || "").trim();
+      if (!selectedText) return;
+      const anchorElement = selection?.anchorNode instanceof Element ? selection.anchorNode : selection?.anchorNode?.parentElement;
+      const focusElement = selection?.focusNode instanceof Element ? selection.focusNode : selection?.focusNode?.parentElement;
+      if ((anchorElement && !preview.contains(anchorElement)) || (focusElement && !preview.contains(focusElement))) return;
+      event.preventDefault();
+      const sourcePath = this.app.workspace.getActiveFile()?.path || "";
+      const menu = new Menu();
+      menu.addItem((item) => {
+        item.setTitle("Ask AI / 提问 AI")
+          .setIcon("sparkles")
+          .onClick(() => openSelectionAiBubble(this, selectedText, sourcePath));
+      });
+      menu.showAtMouseEvent(event);
+    });
+
     this.addCommand({
       id: "generate-weekly-report",
       name: "Generate Weekly Report",
@@ -4931,6 +5580,9 @@ module.exports = class StructuredReviewPlugin extends Plugin {
     });
 
     this.app.workspace.onLayoutReady(() => {
+      if (!this.globalDeskPetCleanup) {
+        this.globalDeskPetCleanup = renderDeskPetPlatform(document.body, this);
+      }
       void this.maybePromptScheduledReports();
     });
     this.registerInterval(window.setInterval(() => {
@@ -5003,6 +5655,10 @@ module.exports = class StructuredReviewPlugin extends Plugin {
   }
 
   async onunload() {
+    if (this.globalDeskPetCleanup) {
+      this.globalDeskPetCleanup();
+      this.globalDeskPetCleanup = null;
+    }
     await this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 };
