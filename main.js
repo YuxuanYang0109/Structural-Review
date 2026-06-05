@@ -13,12 +13,13 @@ const {
   Setting,
   normalizePath,
   requestUrl,
+  setIcon,
 } = require("obsidian");
 
 const VIEW_TYPE = "structured-review-view";
 const TEMPORARY_ARCHIVE_ID = "__temporary_archive__";
 const REPORT_ROOT = "StructuredReview/reports";
-const DEFAULT_DATA = { version: 2, projects: [], entries: [], settings: {} };
+const DEFAULT_DATA = { version: 2, projects: [], entries: [], timelineModules: [], settings: {} };
 const DEFAULT_SETTINGS = {
   deepseekApiKey: "",
   deepseekModel: "deepseek-chat",
@@ -473,6 +474,18 @@ function dateRange(days, endDate = todayYmd()) {
   return dates;
 }
 
+function dateRangeInclusive(startDate, endDate) {
+  const dates = [];
+  const start = parseDateInput(startDate);
+  const end = parseDateInput(endDate);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+  for (const cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
+    dates.push(ymd(cursor));
+  }
+  return dates.length ? dates : [todayYmd()];
+}
+
 function normalizeProjectColor(color, index = 0) {
   const value = String(color || "").trim().toUpperCase();
   const matched = PROJECT_PALETTE.find((item) => item.value === value);
@@ -609,6 +622,33 @@ function normalizeEntry(entry) {
   };
 }
 
+function normalizeTimelineModule(module, index = 0) {
+  const startDate = String(module?.startDate || todayYmd()).slice(0, 10);
+  const endDate = String(module?.endDate || startDate).slice(0, 10);
+  return {
+    id: module?.id || id("module"),
+    projectId: String(module?.projectId || ""),
+    name: String(module?.name || "").trim() || `Module ${index + 1}`,
+    startDate,
+    endDate: endDate < startDate ? startDate : endDate,
+    done: Boolean(module?.done),
+    createdAt: module?.createdAt || nowIso(),
+    updatedAt: module?.updatedAt || nowIso(),
+  };
+}
+
+function validateTimelineModuleInput(input) {
+  const name = String(input?.name || "").trim();
+  const projectId = String(input?.projectId || "").trim();
+  const startDate = String(input?.startDate || "").slice(0, 10);
+  const endDate = String(input?.endDate || "").slice(0, 10);
+  if (!projectId) throw new Error("Module project is required.");
+  if (!name) throw new Error("Module name is required.");
+  if (!startDate) throw new Error("Module start date is required.");
+  if (!endDate) throw new Error("Module end date is required.");
+  if (endDate < startDate) throw new Error("Module end date must be on or after start date.");
+}
+
 class Repository {
   constructor(plugin, data) {
     this.plugin = plugin;
@@ -618,6 +658,7 @@ class Repository {
       version: 2,
       projects: Array.isArray(source.projects) ? source.projects.map(normalizeProject) : [],
       entries: Array.isArray(source.entries) ? source.entries.map(normalizeEntry) : [],
+      timelineModules: Array.isArray(source.timelineModules) ? source.timelineModules.map(normalizeTimelineModule) : [],
       settings: normalizeSettings(source.settings),
     };
   }
@@ -747,6 +788,84 @@ class Repository {
     return this.data.entries.find((entry) => entry.id === entryId) || null;
   }
 
+  listTimelineModules(projectId = null) {
+    return [...(this.data.timelineModules || [])]
+      .filter((module) => !projectId || module.projectId === projectId)
+      .sort((left, right) => {
+        const byStart = left.startDate.localeCompare(right.startDate);
+        if (byStart !== 0) return byStart;
+        return left.name.localeCompare(right.name, "en-US");
+      });
+  }
+
+  getTimelineModule(moduleId) {
+    return (this.data.timelineModules || []).find((module) => module.id === moduleId) || null;
+  }
+
+  createTimelineModule(input) {
+    validateTimelineModuleInput(input);
+    const project = this.getProject(input.projectId);
+    if (!project) throw new Error("Project not found.");
+    if (project.type !== "short-term") throw new Error("Timeline modules can only be added to short-term projects.");
+    const timestamp = nowIso();
+    const module = normalizeTimelineModule({
+      id: id("module"),
+      projectId: project.id,
+      name: input.name,
+      startDate: input.startDate,
+      endDate: input.endDate,
+      done: Boolean(input.done),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }, this.data.timelineModules?.length || 0);
+    this.data.timelineModules = [...(this.data.timelineModules || []), module];
+    project.updatedAt = timestamp;
+    this.notify();
+    return module;
+  }
+
+  async createTimelineModuleAndPersist(input) {
+    const module = this.createTimelineModule(input);
+    await this.persist();
+    return module;
+  }
+
+  updateTimelineModule(moduleId, input) {
+    const module = this.getTimelineModule(moduleId);
+    if (!module) throw new Error("Module not found.");
+    validateTimelineModuleInput(input);
+    const project = this.getProject(input.projectId);
+    if (!project) throw new Error("Project not found.");
+    if (project.type !== "short-term") throw new Error("Timeline modules can only be added to short-term projects.");
+    Object.assign(module, {
+      projectId: project.id,
+      name: String(input.name || "").trim(),
+      startDate: String(input.startDate || "").slice(0, 10),
+      endDate: String(input.endDate || "").slice(0, 10),
+      done: Boolean(input.done),
+      updatedAt: nowIso(),
+    });
+    project.updatedAt = module.updatedAt;
+    this.notify();
+    return module;
+  }
+
+  async updateTimelineModuleAndPersist(moduleId, input) {
+    const module = this.updateTimelineModule(moduleId, input);
+    await this.persist();
+    return module;
+  }
+
+  async deleteTimelineModuleAndPersist(moduleId) {
+    const module = this.getTimelineModule(moduleId);
+    if (!module) throw new Error("Module not found.");
+    this.data.timelineModules = (this.data.timelineModules || []).filter((item) => item.id !== moduleId);
+    const project = this.getProject(module.projectId);
+    if (project) project.updatedAt = nowIso();
+    this.notify();
+    await this.persist();
+  }
+
   createEntry(projectId, input) {
     const project = this.getProject(projectId);
     if (!project) throw new Error("Project not found.");
@@ -851,6 +970,7 @@ class Repository {
     if (!project) throw new Error("Project not found.");
     this.data.projects = this.data.projects.filter((item) => item.id !== projectId);
     this.data.entries = this.data.entries.filter((entry) => entry.projectId !== projectId);
+    this.data.timelineModules = (this.data.timelineModules || []).filter((module) => module.projectId !== projectId);
     this.notify();
     await this.persist();
   }
@@ -1166,6 +1286,14 @@ function summarizeProject(repository, project) {
   };
 }
 
+function daysBetweenExclusive(startDate, endDate) {
+  const start = parseDateInput(startDate);
+  const end = parseDateInput(endDate);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+  return Math.max(0, Math.round((end.getTime() - start.getTime()) / 86400000));
+}
+
 function buildHeatDays(repository, days) {
   const dates = dateRange(days);
   const projects = repository.listProjects();
@@ -1437,16 +1565,41 @@ async function saveOverviewNote(plugin, selectedDate, content) {
   return path;
 }
 
+async function saveDeskPetReply(plugin, content, source = "Desk Pet Reply") {
+  const text = String(content || "").trim();
+  if (!text) throw new Error("Reply is empty.");
+  const folder = "StructuredReview/notes";
+  await ensureVaultFolder(plugin.app, folder);
+  const timestamp = localDateTimeValue().replace(/[-:T]/g, "").slice(0, 12);
+  let path = normalizePath(`${folder}/desk-pet-${timestamp}.md`);
+  let suffix = 2;
+  while (plugin.app.vault.getAbstractFileByPath(path)) {
+    path = normalizePath(`${folder}/desk-pet-${timestamp}-${suffix}.md`);
+    suffix += 1;
+  }
+  const body = [
+    "---",
+    `date: ${todayYmd()}`,
+    `source: ${source}`,
+    "---",
+    "",
+    text,
+    "",
+  ].join("\n");
+  await plugin.app.vault.create(path, body);
+  return path;
+}
+
 function buildDeskPetAiMessages(plugin, selectedDate, noteContent) {
   const repository = plugin.repository;
   const settings = normalizeSettings(plugin.settings);
   const overview = buildOverviewStats(repository, selectedDate);
   const status = dailyStatusEntryForDate(repository, selectedDate);
   const statusLines = [
-    `Mood: ${dailyStatusValue(status, "daily-mood") || "-"}`,
-    `Sleep Rate: ${dailyStatusValue(status, "daily-sleep") || "-"}`,
-    `Sleep Time: ${dailyStatusValue(status, "daily-sleep-time") || "-"}`,
-    `Dream: ${dailyStatusValue(status, "daily-dream") || "-"}`,
+    `User mood rating: ${dailyStatusValue(status, "daily-mood") || "-"}`,
+    `User sleep rating: ${dailyStatusValue(status, "daily-sleep") || "-"}`,
+    `User sleep time: ${dailyStatusValue(status, "daily-sleep-time") || "-"}`,
+    `User dream record: ${dailyStatusValue(status, "daily-dream") || "-"} (This is the user's dream record, not the desk pet's dream.)`,
   ];
   const entries = repository.listEntries()
     .filter((entry) => entry.date === selectedDate)
@@ -1463,27 +1616,33 @@ function buildDeskPetAiMessages(plugin, selectedDate, noteContent) {
     `Total records today: ${overview.totalRecords}`,
     `Most frequent project in 7d: ${overview.mostProject ? `${overview.mostProject.project.name} (${overview.mostProject.count})` : "-"}`,
     `Least frequent completed project in 7d: ${overview.leastProject ? `${overview.leastProject.project.name} (${overview.leastProject.count})` : "-"}`,
-    "Daily Status:",
+    "Low-priority background only - Daily Status:",
     ...statusLines,
-    "Today's records:",
+    "Low-priority background only - Today's records:",
     ...(entryLines.length ? entryLines : ["- No project records."]),
   ].join("\n");
+  const note = String(noteContent || "").trim();
   return [
     {
       role: "system",
       content: [
         settings.petSystemPrompt,
         "你正在作为 Obsidian 插件里的桌宠说话。",
-        "用户刚刚在 Overview 的 Note 输入框里写了一段话。请结合当天状态和记录给出简短回应。",
-        "不要输出标题，不要写长段复盘，不要使用项目符号。",
+        "用户刚刚在 Overview 的 Note 输入框里写了一段话。输入框内容是最高优先级，也是你要直接回应的对象。",
+        "今日状态、睡眠、项目记录和七日统计只作为低权重背景，帮助你理解语气和处境；不要主动围绕它们做复盘、诊断或建议。",
+        "Daily Status 里的 Mood、Sleep、Dream 等字段全部是用户自己的记录，不是你的状态，也不是你的梦。",
+        "只有当用户输入明确提到状态、睡眠、记录、计划或复盘时，才可以轻量引用背景信息。",
+        "如果输入框内容很短或只是情绪表达，也优先回应这句话本身，不要被背景数据带偏。",
+        "不要输出标题，不要写长段复盘，不要使用项目符号。回答控制在 1-3 句话。",
       ].join("\n"),
     },
     {
       role: "user",
       content: [
-        `User note: ${String(noteContent || "").trim() || "(empty)"}`,
+        "Primary user note. Respond to this first:",
+        note || "(empty)",
         "",
-        "Context:",
+        "Weak background context. Use only if it directly helps answer the note:",
         context,
       ].join("\n"),
     },
@@ -2181,6 +2340,7 @@ function renderDeskPetPlatform(root, plugin) {
     speechBubble.empty();
     speechBubble.removeClass("is-visible");
     speechBubble.removeClass("is-ask");
+    speechBubble.removeClass("is-below");
     action = "move";
   };
   const speechIsOpen = () => speechBubble.hasClass("is-visible");
@@ -2199,14 +2359,32 @@ function renderDeskPetPlatform(root, plugin) {
     });
     return closeButton;
   };
+  const updateSpeechPlacement = () => {
+    speechBubble.toggleClass("is-below", isGlobalPet && y < 190);
+  };
+  const bindSpeechSave = (element, getContent, source) => {
+    element.setAttr("title", "Double click to save");
+    element.addEventListener("dblclick", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        const path = await saveDeskPetReply(plugin, getContent(), source);
+        new Notice(`Saved reply: ${path}`);
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Failed to save reply.");
+      }
+    });
+  };
   const showSpeech = (text) => {
     const value = String(text || "").trim();
     if (!value) return;
     speechBubble.empty();
     speechBubble.removeClass("is-ask");
     pauseForSpeech();
+    updateSpeechPlacement();
     createSpeechCloseButton();
-    speechBubble.createDiv({ cls: "sr-deskpet-speech-text", text: value });
+    const textEl = speechBubble.createDiv({ cls: "sr-deskpet-speech-text", text: value });
+    bindSpeechSave(textEl, () => value, "Desk Pet Reply");
     speechBubble.addClass("is-visible");
   };
   const showSelectionAsk = (detail = {}) => {
@@ -2215,6 +2393,7 @@ function renderDeskPetPlatform(root, plugin) {
     const sourcePath = String(detail.sourcePath || "");
     speechBubble.empty();
     pauseForSpeech();
+    updateSpeechPlacement();
     speechBubble.addClass("is-ask");
     createSpeechCloseButton();
     speechBubble.createDiv({ cls: "sr-deskpet-speech-title", text: "Ask AI" });
@@ -2231,6 +2410,8 @@ function renderDeskPetPlatform(root, plugin) {
     systemInput.checked = true;
     option.createSpan({ text: "Send system prompt" });
     const answerBox = speechBubble.createDiv({ cls: "sr-deskpet-speech-answer" });
+    let latestAnswer = "";
+    bindSpeechSave(answerBox, () => latestAnswer || answerBox.textContent || "", "Desk Pet Selection Answer");
     const actions = speechBubble.createDiv({ cls: "sr-deskpet-speech-actions" });
     const sendButton = actions.createEl("button", { text: "Send", type: "button" });
     sendButton.addClass("mod-cta");
@@ -2240,6 +2421,7 @@ function renderDeskPetPlatform(root, plugin) {
       answerBox.setText("Thinking...");
       try {
         const answer = await askSelectionAi(plugin, selectedText, questionInput.value, sourcePath, systemInput.checked);
+        latestAnswer = answer;
         answerBox.setText(answer);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Failed to ask AI.";
@@ -3976,7 +4158,7 @@ function renderOverview(container, plugin, view) {
   renderLifeRpgOverview(hero, plugin, view.selectedDate);
 
   const trendPanel = top.createDiv({ cls: "sr-panel sr-overview-trend-panel" });
-  renderProjectLines(trendPanel, plugin.repository);
+  renderProjectLines(trendPanel, plugin);
 
   const calendarLayout = wrap.createDiv({ cls: "sr-calendar-layout" });
   renderCalendarPanel(calendarLayout.createDiv({ cls: "sr-panel sr-calendar-panel" }), plugin, view);
@@ -4022,7 +4204,8 @@ function renderLifeRpgOverview(container, plugin, selectedDate) {
       new Notice(error instanceof Error ? error.message : "Failed to save note.");
     }
   });
-  aiButton.addEventListener("click", async () => {
+  const sendOverviewNoteToAi = async () => {
+    if (aiButton.disabled) return;
     const originalText = aiButton.textContent || "Send to AI";
     try {
       aiButton.disabled = true;
@@ -4043,6 +4226,14 @@ function renderLifeRpgOverview(container, plugin, selectedDate) {
       aiButton.disabled = false;
       aiButton.setText(originalText);
     }
+  };
+  aiButton.addEventListener("click", () => {
+    void sendOverviewNoteToAi();
+  });
+  noteInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    void sendOverviewNoteToAi();
   });
 
   const statusPanel = grid.createDiv({ cls: "sr-overview-card sr-overview-status-panel" });
@@ -4186,9 +4377,19 @@ function renderHeatCalendar(container, repository) {
   }
 }
 
-function renderProjectLines(container, repository) {
-  container.createEl("h3", { text: "Project Trends" });
-  container.createDiv({ cls: "sr-muted", text: "Curves use recorded time only, merged by domain." });
+function renderProjectLines(container, pluginOrRepository) {
+  const repository = pluginOrRepository?.repository || pluginOrRepository;
+  const plugin = pluginOrRepository?.repository ? pluginOrRepository : null;
+  const header = container.createDiv({ cls: "sr-trend-panel-header" });
+  const title = header.createDiv();
+  title.createEl("h3", { text: "Project Trends" });
+  title.createDiv({ cls: "sr-muted", text: "Curves use recorded time only, merged by domain." });
+  const expandButton = header.createEl("button", { cls: "sr-icon-button sr-trend-expand-button", attr: { "aria-label": "Expand Project Trends" } });
+  setIcon(expandButton, "maximize-2");
+  expandButton.setAttr("title", "Open Task Decomposition Board");
+  expandButton.addEventListener("click", () => {
+    if (plugin) new ProjectTimelineMatrixModal(plugin.app, plugin).open();
+  });
 
   const chart = container.createDiv({ cls: "sr-overview-chart" });
   const pastDates = dateRange(7, todayYmd());
@@ -4616,6 +4817,696 @@ function renderTimeRangeSlider(container, startInput, endInput, fallbackDate = t
 
 function renderDateTimeQuickControls(container, startInput, endInput, fallbackDate = todayYmd()) {
   return renderTimeRangeSlider(container, startInput, endInput, fallbackDate);
+}
+
+function projectMatrixStartDate(project, fallback = todayYmd()) {
+  return String(project?.startDate || projectStartDate(project) || fallback).slice(0, 10);
+}
+
+function projectMatrixEndDate(project, fallback = todayYmd()) {
+  return String(project?.endDate || project?.plannedEndDate || projectEndDate(project) || fallback).slice(0, 10);
+}
+
+function projectTypeClass(type) {
+  return normalizeProjectType(type).replace(/[^a-z0-9]+/g, "-");
+}
+
+function buildProjectDateBuckets(repository, project, rangeStart, rangeEnd) {
+  const buckets = new Map();
+  for (const entry of repository.listEntries(project.id)) {
+    if (entry.date < rangeStart || entry.date > rangeEnd) continue;
+    const bucket = buckets.get(entry.date) || { date: entry.date, minutes: 0, count: 0 };
+    bucket.minutes += entryDurationMinutes(entry);
+    bucket.count += 1;
+    buckets.set(entry.date, bucket);
+  }
+  return buckets;
+}
+
+function projectHasMatrixPresence(repository, project, rangeStart, rangeEnd) {
+  return repository.listEntries(project.id).some((entry) => entry.date >= rangeStart && entry.date <= rangeEnd);
+}
+
+function matrixRangeForMode(mode, repository) {
+  const today = todayYmd();
+  return { start: shiftDays(today, -7), end: shiftDays(today, 7) };
+}
+
+function clampPulseModuleDateRange(dates, startIndex, spanDays = 3) {
+  const dayCount = Math.max(1, dates.length);
+  const start = Math.max(0, Math.min(dayCount - 1, startIndex));
+  const end = Math.max(start, Math.min(dayCount - 1, start + Math.max(1, spanDays) - 1));
+  return { startDate: dates[start], endDate: dates[end], startIndex: start, endIndex: end };
+}
+
+function snapPulseModulePointer(stage, clientX, clientY) {
+  const context = stage?._pulseDropContext;
+  if (!context || !context.dropTargets?.length) return null;
+  const rect = stage.getBoundingClientRect();
+  const inside = clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+  if (!inside) return { inside: false };
+
+  const relativeX = clientX - rect.left;
+  const relativeY = clientY - rect.top;
+  const slotIndex = Math.round((relativeX - context.leftPad - context.dayWidth / 2) / context.dayWidth);
+  const dateIndex = Math.max(0, Math.min(context.dates.length - 1, slotIndex));
+  let target = null;
+  let distance = Infinity;
+  for (const candidate of context.dropTargets) {
+    const nextDistance = Math.abs(relativeY - candidate.y);
+    if (nextDistance < distance) {
+      distance = nextDistance;
+      target = candidate;
+    }
+  }
+  if (!target || distance > context.laneSnapRadius) return { inside: true, snapped: false };
+
+  const range = clampPulseModuleDateRange(context.dates, dateIndex, 3);
+  return {
+    inside: true,
+    snapped: true,
+    projectId: target.projectId,
+    projectName: target.projectName,
+    color: target.color,
+    startDate: range.startDate,
+    endDate: range.endDate,
+    x: context.leftPad + range.startIndex * context.dayWidth + 5,
+    y: target.y - 14,
+    width: Math.max(44, (range.endIndex - range.startIndex + 1) * context.dayWidth - 10),
+    height: 28,
+  };
+}
+
+function pulseDateIndexFromClientX(stage, clientX) {
+  const context = stage?._pulseDropContext;
+  if (!context) return 0;
+  const rect = stage.getBoundingClientRect();
+  const relativeX = clientX - rect.left;
+  return Math.max(0, Math.min(
+    context.dates.length - 1,
+    Math.floor((relativeX - context.leftPad) / context.dayWidth)
+  ));
+}
+
+function attachPulseModulePointerDrag(item, plugin, body, rerender) {
+  item.draggable = false;
+  let suppressClick = false;
+
+  item.addEventListener("click", (event) => {
+    if (!suppressClick) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    suppressClick = false;
+  }, true);
+
+  item.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.isPrimary === false) return;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let dragging = false;
+    let latestPoint = null;
+    let frame = 0;
+    let ghost = null;
+    let lastSnapped = null;
+
+    const currentStage = () => body.querySelector(".sr-pulse-stage");
+    const currentOverlay = () => currentStage()?.querySelector(".sr-pulse-stage-overlays");
+
+    const ensurePreview = (snapped) => {
+      const overlay = currentOverlay();
+      if (!overlay) return null;
+      if (!ghost || ghost.parentElement !== overlay) {
+        ghost?.remove();
+        ghost = overlay.createDiv({ cls: "sr-pulse-module-ghost" });
+        ghost.createSpan({ cls: "sr-pulse-module-ghost-name", text: "New Module" });
+        ghost.createSpan({ cls: "sr-pulse-module-ghost-date" });
+      }
+      ghost.style.setProperty("--project-color", snapped.color);
+      return ghost;
+    };
+
+    const hidePreview = () => {
+      lastSnapped = null;
+      currentStage()?.removeClass("is-module-drop-target");
+      ghost?.removeClass("is-visible");
+      ghost?.removeClass("is-snapped");
+    };
+
+    const removePreview = () => {
+      ghost?.remove();
+      ghost = null;
+      currentStage()?.removeClass("is-module-drop-target");
+    };
+
+    const updatePreview = () => {
+      frame = 0;
+      if (!latestPoint) return;
+      const stage = currentStage();
+      const snapped = snapPulseModulePointer(stage, latestPoint.x, latestPoint.y);
+      if (!snapped?.inside || !snapped.snapped) {
+        hidePreview();
+        return;
+      }
+      lastSnapped = snapped;
+      const preview = ensurePreview(snapped);
+      if (!preview) return;
+      stage.addClass("is-module-drop-target");
+      preview.style.width = `${snapped.width}px`;
+      preview.style.height = `${snapped.height}px`;
+      preview.style.transform = `translate(${snapped.x}px, ${snapped.y}px)`;
+      preview.querySelector(".sr-pulse-module-ghost-date")?.setText(`${snapped.projectName} · ${snapped.startDate.slice(5)}-${snapped.endDate.slice(5)}`);
+      preview.addClass("is-visible");
+      preview.addClass("is-snapped");
+    };
+
+    const schedulePreview = (point) => {
+      latestPoint = point;
+      if (!frame) frame = requestAnimationFrame(updatePreview);
+    };
+
+    const onPointerMove = (moveEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      const deltaX = moveEvent.clientX - startX;
+      const deltaY = moveEvent.clientY - startY;
+      if (!dragging && Math.hypot(deltaX, deltaY) < 4) return;
+      if (!dragging) {
+        dragging = true;
+        item.addClass("is-dragging");
+        item.setPointerCapture?.(event.pointerId);
+      }
+      moveEvent.preventDefault();
+      schedulePreview({ x: moveEvent.clientX, y: moveEvent.clientY });
+    };
+
+    const cleanup = () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", onPointerUp);
+      document.removeEventListener("pointercancel", onPointerCancel);
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      item.removeClass("is-dragging");
+      removePreview();
+    };
+
+    const onPointerUp = async (upEvent) => {
+      if (upEvent.pointerId !== event.pointerId) return;
+      const snapped = lastSnapped;
+      const shouldCreate = dragging && snapped?.inside && snapped.snapped;
+      cleanup();
+      if (!dragging) return;
+      suppressClick = true;
+      upEvent.preventDefault();
+      if (!shouldCreate) return;
+      try {
+        await plugin.repository.createTimelineModuleAndPersist({
+          projectId: snapped.projectId,
+          name: `Module ${snapped.startDate.slice(5)}`,
+          startDate: snapped.startDate,
+          endDate: snapped.endDate,
+        });
+        rerender?.();
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Failed to create module.");
+      }
+    };
+
+    const onPointerCancel = (cancelEvent) => {
+      if (cancelEvent.pointerId !== event.pointerId) return;
+      cleanup();
+    };
+
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+    document.addEventListener("pointercancel", onPointerCancel);
+  });
+}
+
+function attachPulseModuleResize(block, handle, plugin, module, side, rerender) {
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.isPrimary === false) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const stage = block.closest(".sr-pulse-stage");
+    const context = stage?._pulseDropContext;
+    if (!stage || !context) return;
+
+    let startIndex = Math.max(0, Math.min(context.dates.length - 1, daysBetweenExclusive(context.rangeStart, module.startDate)));
+    let endIndex = Math.max(startIndex, Math.min(context.dates.length - 1, daysBetweenExclusive(context.rangeStart, module.endDate)));
+    let dragging = false;
+    let latestX = event.clientX;
+    let frame = 0;
+
+    const applyPreview = () => {
+      frame = 0;
+      const index = pulseDateIndexFromClientX(stage, latestX);
+      if (side === "left") startIndex = Math.min(index, endIndex);
+      else endIndex = Math.max(index, startIndex);
+      block.style.left = `${context.leftPad + startIndex * context.dayWidth + 5}px`;
+      block.style.width = `${Math.max(36, (endIndex - startIndex + 1) * context.dayWidth - 10)}px`;
+      block.querySelector(".sr-pulse-module-range")?.setText(`${context.dates[startIndex].slice(5)}-${context.dates[endIndex].slice(5)}`);
+    };
+
+    const schedulePreview = (x) => {
+      latestX = x;
+      if (!frame) frame = requestAnimationFrame(applyPreview);
+    };
+
+    const onPointerMove = (moveEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      if (!dragging && Math.abs(moveEvent.clientX - event.clientX) < 3) return;
+      if (!dragging) {
+        dragging = true;
+        block.dataset.suppressClick = "true";
+        block.addClass("is-resizing");
+        handle.setPointerCapture?.(event.pointerId);
+      }
+      moveEvent.preventDefault();
+      schedulePreview(moveEvent.clientX);
+    };
+
+    const cleanup = () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", onPointerUp);
+      document.removeEventListener("pointercancel", onPointerCancel);
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      block.removeClass("is-resizing");
+    };
+
+    const onPointerUp = async (upEvent) => {
+      if (upEvent.pointerId !== event.pointerId) return;
+      cleanup();
+      if (!dragging) return;
+      upEvent.preventDefault();
+      try {
+        await plugin.repository.updateTimelineModuleAndPersist(module.id, {
+          ...module,
+          startDate: context.dates[startIndex],
+          endDate: context.dates[endIndex],
+        });
+        rerender?.();
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Failed to resize module.");
+      }
+    };
+
+    const onPointerCancel = (cancelEvent) => {
+      if (cancelEvent.pointerId !== event.pointerId) return;
+      cleanup();
+    };
+
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+    document.addEventListener("pointercancel", onPointerCancel);
+  });
+}
+
+function openPulseModuleRename(block, plugin, module, rerender) {
+  if (block.querySelector(".sr-pulse-module-name-input")) return;
+  const nameEl = block.querySelector(".sr-pulse-module-name");
+  if (!nameEl) return;
+  const input = document.createElement("input");
+  input.className = "sr-pulse-module-name-input";
+  input.type = "text";
+  input.value = module.name;
+  input.setAttribute("aria-label", "Module name");
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let saved = false;
+  const save = async () => {
+    if (saved) return;
+    saved = true;
+    const name = input.value.trim();
+    if (!name || name === module.name) {
+      rerender?.();
+      return;
+    }
+    try {
+      await plugin.repository.updateTimelineModuleAndPersist(module.id, { ...module, name });
+      rerender?.();
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : "Failed to rename module.");
+      rerender?.();
+    }
+  };
+
+  input.addEventListener("click", (event) => event.stopPropagation());
+  input.addEventListener("dblclick", (event) => event.stopPropagation());
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void save();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      rerender?.();
+    }
+  });
+  input.addEventListener("blur", () => void save());
+}
+
+function renderProjectTimelineMatrix(container, plugin, state) {
+  const repository = plugin.repository;
+  container.empty();
+  const range = matrixRangeForMode(state.rangeMode, repository);
+  const dates = dateRangeInclusive(range.start, range.end);
+  const dayCount = Math.max(1, dates.length);
+  const dayWidth = 98;
+  const stageWidth = dayCount * dayWidth + 96;
+  const leftPad = 48;
+  const rightPad = 48;
+  const dateLabel = (date) => {
+    return parseDateInput(date).toLocaleDateString("en-US", { month: "short", day: "2-digit" }).replace(" ", ".");
+  };
+  const projectOverlapsRange = (project) => {
+    const start = projectMatrixStartDate(project, range.start);
+    const end = projectMatrixEndDate(project, range.end);
+    return start <= range.end && end >= range.start;
+  };
+
+  const shortProjects = repository
+    .listProjects()
+    .filter((project, index) => project.isActive && !project.completed && normalizeProjectType(project.type) === "short-term" && !isSleepProject(project, index))
+    .filter(projectOverlapsRange)
+    .sort((left, right) => projectMatrixStartDate(left, range.start).localeCompare(projectMatrixStartDate(right, range.start)) || left.name.localeCompare(right.name, "en-US"));
+  const longProjects = repository
+    .listProjects()
+    .filter((project, index) => project.isActive && normalizeProjectType(project.type) === "long-term" && !isDailyStatusProject(project) && !isSleepProject(project, index))
+    .filter((project) => projectHasMatrixPresence(repository, project, range.start, range.end))
+    .sort((left, right) => left.name.localeCompare(right.name, "en-US"));
+  const projects = [...shortProjects, ...longProjects];
+
+  if (projects.length === 0) {
+    container.createDiv({ cls: "sr-empty", text: "No active short-term plans or long-term records in this 15-day window." });
+    return;
+  }
+
+  const stageHeight = Math.max(220, Math.min(430, projects.length * 42 + 104));
+  const topPad = 58;
+  const bottomPad = 34;
+  const usableHeight = Math.max(80, stageHeight - topPad - bottomPad);
+  const centerY = topPad + usableHeight / 2;
+  const laneGap = projects.length <= 1 ? 0 : Math.min(42, usableHeight / (projects.length - 1));
+  const firstY = projects.length <= 1 ? centerY : centerY - laneGap * (projects.length - 1) / 2;
+  const xForDate = (date) => leftPad + (Math.max(0, Math.min(dayCount - 1, daysBetweenExclusive(range.start, date))) + 0.5) * dayWidth;
+  const xForDateEdge = (date) => leftPad + Math.max(0, Math.min(dayCount, daysBetweenExclusive(range.start, date))) * dayWidth;
+  const yForLane = (index) => firstY + laneGap * index;
+  const compressedY = (y) => centerY + (y - centerY) * 0.28;
+  const pathForLane = (y) => {
+    const startY = compressedY(y);
+    const endY = compressedY(y);
+    const rangeLeft = leftPad;
+    const rangeRight = stageWidth - rightPad;
+    return `M 16 ${startY} C ${leftPad * 0.44} ${startY}, ${leftPad * 0.62} ${y}, ${rangeLeft} ${y} L ${rangeRight} ${y} C ${stageWidth - leftPad * 0.62} ${y}, ${stageWidth - leftPad * 0.44} ${endY}, ${stageWidth - 16} ${endY}`;
+  };
+
+  const stage = container.createDiv({ cls: "sr-pulse-stage" });
+  stage.style.width = `${stageWidth}px`;
+  stage.style.height = `${stageHeight}px`;
+  stage.style.setProperty("--stage-width", `${stageWidth}px`);
+  stage.style.setProperty("--stage-height", `${stageHeight}px`);
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.classList.add("sr-pulse-stage-svg");
+  svg.setAttribute("viewBox", `0 0 ${stageWidth} ${stageHeight}`);
+  svg.setAttribute("width", String(stageWidth));
+  svg.setAttribute("height", String(stageHeight));
+  stage.appendChild(svg);
+
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  svg.appendChild(defs);
+
+  for (const [index, date] of dates.entries()) {
+    const x = xForDate(date);
+    const guide = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    guide.setAttribute("x1", String(x));
+    guide.setAttribute("x2", String(x));
+    guide.setAttribute("y1", "58");
+    guide.setAttribute("y2", String(stageHeight - 38));
+    guide.setAttribute("class", date === todayYmd() ? "sr-pulse-guide is-today" : "sr-pulse-guide");
+    svg.appendChild(guide);
+
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    text.setAttribute("x", String(x));
+    text.setAttribute("y", "38");
+    text.setAttribute("text-anchor", "middle");
+    text.setAttribute("class", "sr-pulse-date-label");
+    text.textContent = dateLabel(date);
+    svg.appendChild(text);
+  }
+
+  const overlays = stage.createDiv({ cls: "sr-pulse-stage-overlays" });
+  overlays.style.width = `${stageWidth}px`;
+  overlays.style.height = `${stageHeight}px`;
+  const dropTargets = [];
+  stage._pulseDropContext = {
+    rangeStart: range.start,
+    dates,
+    dayWidth,
+    leftPad,
+    dropTargets,
+    laneSnapRadius: 28,
+  };
+
+  projects.forEach((project, projectIndex) => {
+    const y = yForLane(projectIndex);
+    const type = normalizeProjectType(project.type);
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pathForLane(y));
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", project.color);
+    path.setAttribute("stroke-width", type === "long-term" ? "3" : "4");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("opacity", type === "long-term" ? "0.56" : "0.42");
+    path.setAttribute("class", `sr-pulse-track-path is-${projectTypeClass(project.type)}`);
+    svg.appendChild(path);
+
+    if (type === "long-term") {
+      const buckets = buildProjectDateBuckets(repository, project, range.start, range.end);
+      const label = overlays.createDiv({ cls: "sr-pulse-long-label", text: project.name });
+      label.style.left = `${leftPad}px`;
+      label.style.top = `${y - 30}px`;
+      label.style.setProperty("--project-color", project.color);
+      for (const bucket of buckets.values()) {
+        const index = dates.indexOf(bucket.date);
+        if (index === -1) continue;
+        const node = overlays.createDiv({ cls: "sr-pulse-long-node" });
+        const hours = bucket.minutes / 60;
+        const radius = Math.max(4, Math.min(14, 4 + hours * 3.2));
+        const size = radius * 2;
+        node.style.left = `${xForDate(bucket.date)}px`;
+        node.style.top = `${y}px`;
+        node.style.width = `${size}px`;
+        node.style.height = `${size}px`;
+        node.style.setProperty("--project-color", project.color);
+        node.setAttr("title", `${project.name}\n${bucket.date}\n${durationLabelFromMinutes(bucket.minutes)}\n${bucket.count} records`);
+      }
+      return;
+    }
+
+    dropTargets.push({ projectId: project.id, projectName: project.name, color: project.color, y });
+    const slot = overlays.createDiv({ cls: "sr-pulse-short-slot" });
+    slot.style.left = `${leftPad}px`;
+      slot.style.top = `${y - 16}px`;
+      slot.style.width = `${dayCount * dayWidth}px`;
+      slot.style.height = "32px";
+    slot.style.setProperty("--project-color", project.color);
+    slot.setAttr("title", `${project.name}\nDrop module here`);
+    slot.createSpan({ cls: "sr-pulse-slot-label", text: project.name });
+    const slotCells = slot.createDiv({ cls: "sr-pulse-slot-cells" });
+    slotCells.style.setProperty("--day-count", String(dayCount));
+    for (const date of dates) {
+      slotCells.createSpan({ cls: date === todayYmd() ? "is-today" : "" });
+    }
+
+    const modules = repository.listTimelineModules(project.id).filter((module) => module.startDate <= range.end && module.endDate >= range.start);
+    const renderModuleBlock = (module) => {
+      const visibleStart = module.startDate < range.start ? range.start : module.startDate;
+      const visibleEnd = module.endDate > range.end ? range.end : module.endDate;
+      const startIndex = Math.max(0, Math.min(dayCount - 1, daysBetweenExclusive(range.start, visibleStart)));
+      const endIndex = Math.max(startIndex, Math.min(dayCount - 1, daysBetweenExclusive(range.start, visibleEnd)));
+      const blockLeft = xForDateEdge(visibleStart) + 5;
+      const blockWidth = Math.max(36, (endIndex - startIndex + 1) * dayWidth - 10);
+      const block = overlays.createDiv({ cls: module.done ? "sr-pulse-module-block is-done" : "sr-pulse-module-block" });
+      block.style.left = `${blockLeft}px`;
+      block.style.top = `${y - 13}px`;
+      block.style.width = `${blockWidth}px`;
+      block.style.height = "26px";
+      block.style.setProperty("--project-color", project.color);
+      block.setAttr("title", `${project.name}\n${module.name}\n${module.startDate} → ${module.endDate}\nClick: toggle done\nDouble click: rename\nDrag edges: resize`);
+      const leftHandle = block.createSpan({ cls: "sr-pulse-module-handle is-left" });
+      block.createSpan({ cls: "sr-pulse-module-name", text: module.name });
+      block.createSpan({ cls: "sr-pulse-module-range", text: `${visibleStart.slice(5)}-${visibleEnd.slice(5)}` });
+      block.createSpan({ cls: "sr-pulse-module-check", text: module.done ? "Done" : "" });
+      const rightHandle = block.createSpan({ cls: "sr-pulse-module-handle is-right" });
+      let clickTimer = 0;
+      block.addEventListener("click", (event) => {
+        if (event.target.closest(".sr-pulse-module-handle")) return;
+        if (event.detail > 1) return;
+        if (block.dataset.suppressClick === "true") {
+          block.dataset.suppressClick = "";
+          return;
+        }
+        window.clearTimeout(clickTimer);
+        clickTimer = window.setTimeout(async () => {
+          try {
+            await repository.updateTimelineModuleAndPersist(module.id, { ...module, done: !module.done });
+            renderProjectTimelineMatrix(container, plugin, state);
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : "Failed to update module.");
+          }
+        }, 320);
+      });
+      block.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        window.clearTimeout(clickTimer);
+        openPulseModuleRename(block, plugin, module, () => renderProjectTimelineMatrix(container, plugin, state));
+      });
+      attachPulseModuleResize(block, leftHandle, plugin, module, "left", () => renderProjectTimelineMatrix(container, plugin, state));
+      attachPulseModuleResize(block, rightHandle, plugin, module, "right", () => renderProjectTimelineMatrix(container, plugin, state));
+    };
+    for (const module of modules) renderModuleBlock(module);
+  });
+
+}
+
+class TimelineModuleModal extends Modal {
+  constructor(app, plugin, module, onSaved) {
+    super(app);
+    this.plugin = plugin;
+    this.module = module || null;
+    this.onSaved = onSaved;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    const repository = this.plugin.repository;
+    const shortProjects = repository
+      .listProjects()
+      .filter((project, index) => project.type === "short-term" && project.isActive && !isSleepProject(project, index));
+    contentEl.empty();
+    contentEl.createEl("h2", { text: this.module ? "Edit Timeline Module" : "Add Timeline Module" });
+    if (shortProjects.length === 0) {
+      contentEl.createDiv({ cls: "sr-empty", text: "No active short-term projects available." });
+      return;
+    }
+    const form = contentEl.createDiv({ cls: "sr-form" });
+
+    const projectRow = form.createDiv({ cls: "sr-form-row" });
+    projectRow.createEl("label", { text: "Short-term Project" });
+    const projectSelect = projectRow.createEl("select");
+    for (const project of shortProjects) {
+      projectSelect.createEl("option", { value: project.id, text: project.name });
+    }
+    projectSelect.value = this.module?.projectId || shortProjects[0].id;
+
+    const nameRow = form.createDiv({ cls: "sr-form-row" });
+    nameRow.createEl("label", { text: "Module Name" });
+    const nameInput = nameRow.createEl("input");
+    nameInput.type = "text";
+    nameInput.placeholder = "Literature Review";
+    nameInput.value = this.module?.name || "";
+
+    const startRow = form.createDiv({ cls: "sr-form-row" });
+    startRow.createEl("label", { text: "Start Date" });
+    const startInput = startRow.createEl("input", { type: "date" });
+    startInput.value = this.module?.startDate || projectStartDate(repository.getProject(projectSelect.value)) || todayYmd();
+
+    const endRow = form.createDiv({ cls: "sr-form-row" });
+    endRow.createEl("label", { text: "End Date" });
+    const endInput = endRow.createEl("input", { type: "date" });
+    endInput.value = this.module?.endDate || startInput.value;
+
+    projectSelect.addEventListener("change", () => {
+      const project = repository.getProject(projectSelect.value);
+      if (!this.module && project) {
+        startInput.value = projectStartDate(project) || todayYmd();
+        endInput.value = startInput.value;
+      }
+    });
+    startInput.addEventListener("change", () => {
+      if (!endInput.value || endInput.value < startInput.value) endInput.value = startInput.value;
+    });
+
+    const actions = form.createDiv({ cls: "sr-entry-actions" });
+    actions.createEl("button", { text: "Cancel", type: "button" }).addEventListener("click", () => this.close());
+    if (this.module) {
+      const deleteButton = actions.createEl("button", { text: "Delete", type: "button" });
+      deleteButton.addClass("mod-warning");
+      deleteButton.addEventListener("click", async () => {
+        if (!confirm(`Delete module "${this.module.name}"?`)) return;
+        await repository.deleteTimelineModuleAndPersist(this.module.id);
+        this.close();
+        this.onSaved?.();
+      });
+    }
+    const saveButton = actions.createEl("button", { text: this.module ? "Save Module" : "Add Module", type: "button" });
+    saveButton.addClass("mod-cta");
+    saveButton.addEventListener("click", async () => {
+      try {
+        const payload = {
+          projectId: projectSelect.value,
+          name: nameInput.value,
+          startDate: startInput.value,
+          endDate: endInput.value,
+          done: Boolean(this.module?.done),
+        };
+        if (this.module) await repository.updateTimelineModuleAndPersist(this.module.id, payload);
+        else await repository.createTimelineModuleAndPersist(payload);
+        this.close();
+        this.onSaved?.();
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Failed to save module.");
+      }
+    });
+
+    window.setTimeout(() => nameInput.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class ProjectTimelineMatrixModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+    this.state = {
+      types: new Set(["long-term", "short-term", "temporary"]),
+    };
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl?.addClass("sr-trend-matrix-modal-shell");
+    contentEl.empty();
+    contentEl.addClass("sr-trend-matrix-modal");
+    const header = contentEl.createDiv({ cls: "sr-matrix-header" });
+    const title = header.createDiv();
+    title.createEl("h2", { text: "Task Decomposition" });
+    title.createDiv({ cls: "sr-muted", text: "Centered 15-day plan. Short-term modules can be stretched, renamed, and checked off; long-term work appears as nodes." });
+    const controls = header.createDiv({ cls: "sr-matrix-controls" });
+    controls.createDiv({ cls: "sr-matrix-range-pill", text: "15D" });
+    const moduleTemplate = controls.createDiv({ cls: "sr-pulse-module-template" });
+    moduleTemplate.createSpan({ cls: "sr-pulse-module-template-icon", text: "+" });
+    moduleTemplate.createSpan({ text: "Module" });
+    const body = contentEl.createDiv({ cls: "sr-matrix-scroll" });
+
+    const render = () => {
+      renderProjectTimelineMatrix(body, this.plugin, this.state);
+    };
+
+    attachPulseModulePointerDrag(moduleTemplate, this.plugin, body, render);
+    render();
+  }
+
+  onClose() {
+    this.modalEl?.removeClass("sr-trend-matrix-modal-shell");
+    this.contentEl.empty();
+  }
 }
 
 function renderTimeRangeValueSlider(container, input, options = {}) {

@@ -1,7 +1,7 @@
 {
   "id": "structured-review",
   "name": "Structured Review",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.5.0",
   "description": "Structured project-based logging and review for Obsidian.",
   "author": "OpenAI Codex",
