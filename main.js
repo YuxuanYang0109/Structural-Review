@@ -628,7 +628,7 @@ function normalizeTimelineModule(module, index = 0) {
   return {
     id: module?.id || id("module"),
     projectId: String(module?.projectId || ""),
-    name: String(module?.name || "").trim() || `Module ${index + 1}`,
+    name: String(module?.name || "").trim() || `Plan ${index + 1}`,
     startDate,
     endDate: endDate < startDate ? startDate : endDate,
     done: Boolean(module?.done),
@@ -642,11 +642,11 @@ function validateTimelineModuleInput(input) {
   const projectId = String(input?.projectId || "").trim();
   const startDate = String(input?.startDate || "").slice(0, 10);
   const endDate = String(input?.endDate || "").slice(0, 10);
-  if (!projectId) throw new Error("Module project is required.");
-  if (!name) throw new Error("Module name is required.");
-  if (!startDate) throw new Error("Module start date is required.");
-  if (!endDate) throw new Error("Module end date is required.");
-  if (endDate < startDate) throw new Error("Module end date must be on or after start date.");
+  if (!projectId) throw new Error("Plan project is required.");
+  if (!name) throw new Error("Plan name is required.");
+  if (!startDate) throw new Error("Plan start date is required.");
+  if (!endDate) throw new Error("Plan end date is required.");
+  if (endDate < startDate) throw new Error("Plan end date must be on or after start date.");
 }
 
 class Repository {
@@ -806,7 +806,7 @@ class Repository {
     validateTimelineModuleInput(input);
     const project = this.getProject(input.projectId);
     if (!project) throw new Error("Project not found.");
-    if (project.type !== "short-term") throw new Error("Timeline modules can only be added to short-term projects.");
+    if (!["short-term", "long-term"].includes(project.type)) throw new Error("Plans can only be added to short-term or long-term projects.");
     const timestamp = nowIso();
     const module = normalizeTimelineModule({
       id: id("module"),
@@ -836,7 +836,7 @@ class Repository {
     validateTimelineModuleInput(input);
     const project = this.getProject(input.projectId);
     if (!project) throw new Error("Project not found.");
-    if (project.type !== "short-term") throw new Error("Timeline modules can only be added to short-term projects.");
+    if (!["short-term", "long-term"].includes(project.type)) throw new Error("Plans can only be added to short-term or long-term projects.");
     Object.assign(module, {
       projectId: project.id,
       name: String(input.name || "").trim(),
@@ -4835,12 +4835,35 @@ function buildProjectDateBuckets(repository, project, rangeStart, rangeEnd) {
   const buckets = new Map();
   for (const entry of repository.listEntries(project.id)) {
     if (entry.date < rangeStart || entry.date > rangeEnd) continue;
-    const bucket = buckets.get(entry.date) || { date: entry.date, minutes: 0, count: 0 };
+    const bucket = buckets.get(entry.date) || { date: entry.date, minutes: 0, count: 0, entries: [] };
     bucket.minutes += entryDurationMinutes(entry);
     bucket.count += 1;
+    bucket.entries.push(entry);
     buckets.set(entry.date, bucket);
   }
   return buckets;
+}
+
+function pulseEntryDetailLines(project, entries) {
+  return entries.map((entry) => {
+    const range = clampEntryToDate(entry, entry.date);
+    const time = range
+      ? `${clockLabelFromMinutes(range.startMinutes)}-${clockLabelFromMinutes(range.endMinutes)}`
+      : entryTimeLabel(entry);
+    const values = project.fields
+      .map((field) => {
+        const value = entry.values[field.id];
+        if (value == null || value === "" || (Array.isArray(value) && value.length === 0)) return "";
+        return `${field.name}: ${Array.isArray(value) ? value.join(", ") : String(value)}`;
+      })
+      .filter(Boolean)
+      .join(" · ");
+    return {
+      time,
+      duration: durationLabelFromMinutes(entryDurationMinutes(entry)),
+      values,
+    };
+  });
 }
 
 function projectHasMatrixPresence(repository, project, rangeStart, rangeEnd) {
@@ -4938,7 +4961,7 @@ function attachPulseModulePointerDrag(item, plugin, body, rerender) {
       if (!ghost || ghost.parentElement !== overlay) {
         ghost?.remove();
         ghost = overlay.createDiv({ cls: "sr-pulse-module-ghost" });
-        ghost.createSpan({ cls: "sr-pulse-module-ghost-name", text: "New Module" });
+        ghost.createSpan({ cls: "sr-pulse-module-ghost-name", text: "New Plan" });
         ghost.createSpan({ cls: "sr-pulse-module-ghost-date" });
       }
       ghost.style.setProperty("--project-color", snapped.color);
@@ -5020,13 +5043,13 @@ function attachPulseModulePointerDrag(item, plugin, body, rerender) {
       try {
         await plugin.repository.createTimelineModuleAndPersist({
           projectId: snapped.projectId,
-          name: `Module ${snapped.startDate.slice(5)}`,
+          name: `Plan ${snapped.startDate.slice(5)}`,
           startDate: snapped.startDate,
           endDate: snapped.endDate,
         });
         rerender?.();
       } catch (error) {
-        new Notice(error instanceof Error ? error.message : "Failed to create module.");
+        new Notice(error instanceof Error ? error.message : "Failed to create plan.");
       }
     };
 
@@ -5106,7 +5129,87 @@ function attachPulseModuleResize(block, handle, plugin, module, side, rerender) 
         });
         rerender?.();
       } catch (error) {
-        new Notice(error instanceof Error ? error.message : "Failed to resize module.");
+        new Notice(error instanceof Error ? error.message : "Failed to resize plan.");
+      }
+    };
+
+    const onPointerCancel = (cancelEvent) => {
+      if (cancelEvent.pointerId !== event.pointerId) return;
+      cleanup();
+    };
+
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+    document.addEventListener("pointercancel", onPointerCancel);
+  });
+}
+
+function attachPulseModuleMove(block, plugin, module, rerender) {
+  block.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.isPrimary === false) return;
+    if (event.target.closest(".sr-pulse-module-handle, .sr-pulse-module-name-input")) return;
+    const stage = block.closest(".sr-pulse-stage");
+    const context = stage?._pulseDropContext;
+    if (!stage || !context) return;
+
+    const durationDays = Math.max(1, Math.min(
+      context.dates.length,
+      daysBetweenExclusive(module.startDate, module.endDate) + 1
+    ));
+    const maxStartIndex = Math.max(0, context.dates.length - durationDays);
+    const initialStartIndex = Math.max(0, Math.min(maxStartIndex, daysBetweenExclusive(context.rangeStart, module.startDate)));
+    let startIndex = initialStartIndex;
+    let dragging = false;
+    let latestX = event.clientX;
+    let frame = 0;
+
+    const applyPreview = () => {
+      frame = 0;
+      const deltaDays = Math.round((latestX - event.clientX) / context.dayWidth);
+      startIndex = Math.max(0, Math.min(maxStartIndex, initialStartIndex + deltaDays));
+      const endIndex = startIndex + durationDays - 1;
+      block.style.left = `${context.leftPad + startIndex * context.dayWidth + 5}px`;
+      block.querySelector(".sr-pulse-module-range")?.setText(`${context.dates[startIndex].slice(5)}-${context.dates[endIndex].slice(5)}`);
+    };
+
+    const onPointerMove = (moveEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      if (!dragging && Math.abs(moveEvent.clientX - event.clientX) < 4) return;
+      if (!dragging) {
+        dragging = true;
+        block.dataset.suppressClick = "true";
+        block.addClass("is-moving");
+        block.setPointerCapture?.(event.pointerId);
+      }
+      moveEvent.preventDefault();
+      latestX = moveEvent.clientX;
+      if (!frame) frame = requestAnimationFrame(applyPreview);
+    };
+
+    const cleanup = () => {
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", onPointerUp);
+      document.removeEventListener("pointercancel", onPointerCancel);
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      block.removeClass("is-moving");
+    };
+
+    const onPointerUp = async (upEvent) => {
+      if (upEvent.pointerId !== event.pointerId) return;
+      cleanup();
+      if (!dragging) return;
+      upEvent.preventDefault();
+      const endIndex = startIndex + durationDays - 1;
+      try {
+        await plugin.repository.updateTimelineModuleAndPersist(module.id, {
+          ...module,
+          startDate: context.dates[startIndex],
+          endDate: context.dates[endIndex],
+        });
+        rerender?.();
+      } catch (error) {
+        new Notice(error instanceof Error ? error.message : "Failed to move plan.");
       }
     };
 
@@ -5129,7 +5232,7 @@ function openPulseModuleRename(block, plugin, module, rerender) {
   input.className = "sr-pulse-module-name-input";
   input.type = "text";
   input.value = module.name;
-  input.setAttribute("aria-label", "Module name");
+  input.setAttribute("aria-label", "Plan name");
   nameEl.replaceWith(input);
   input.focus();
   input.select();
@@ -5147,7 +5250,7 @@ function openPulseModuleRename(block, plugin, module, rerender) {
       await plugin.repository.updateTimelineModuleAndPersist(module.id, { ...module, name });
       rerender?.();
     } catch (error) {
-      new Notice(error instanceof Error ? error.message : "Failed to rename module.");
+      new Notice(error instanceof Error ? error.message : "Failed to rename plan.");
       rerender?.();
     }
   };
@@ -5172,23 +5275,20 @@ function renderProjectTimelineMatrix(container, plugin, state) {
   const range = matrixRangeForMode(state.rangeMode, repository);
   const dates = dateRangeInclusive(range.start, range.end);
   const dayCount = Math.max(1, dates.length);
-  const dayWidth = 98;
-  const stageWidth = dayCount * dayWidth + 96;
-  const leftPad = 48;
-  const rightPad = 48;
+  const measuredWidth = Math.floor(container.getBoundingClientRect().width || container.clientWidth || 0);
+  const fallbackWidth = Math.floor(Math.min(1720, window.innerWidth * 0.88));
+  const stageWidth = Math.max(360, measuredWidth > 40 ? measuredWidth - 4 : fallbackWidth);
+  const edgePad = Math.max(32, Math.min(48, stageWidth * 0.035));
+  const leftPad = edgePad;
+  const rightPad = edgePad;
+  const dayWidth = (stageWidth - leftPad - rightPad) / dayCount;
   const dateLabel = (date) => {
     return parseDateInput(date).toLocaleDateString("en-US", { month: "short", day: "2-digit" }).replace(" ", ".");
   };
-  const projectOverlapsRange = (project) => {
-    const start = projectMatrixStartDate(project, range.start);
-    const end = projectMatrixEndDate(project, range.end);
-    return start <= range.end && end >= range.start;
-  };
-
   const shortProjects = repository
     .listProjects()
     .filter((project, index) => project.isActive && !project.completed && normalizeProjectType(project.type) === "short-term" && !isSleepProject(project, index))
-    .filter(projectOverlapsRange)
+    .filter((project) => projectHasMatrixPresence(repository, project, range.start, range.end))
     .sort((left, right) => projectMatrixStartDate(left, range.start).localeCompare(projectMatrixStartDate(right, range.start)) || left.name.localeCompare(right.name, "en-US"));
   const longProjects = repository
     .listProjects()
@@ -5198,13 +5298,14 @@ function renderProjectTimelineMatrix(container, plugin, state) {
   const projects = [...shortProjects, ...longProjects];
 
   if (projects.length === 0) {
-    container.createDiv({ cls: "sr-empty", text: "No active short-term plans or long-term records in this 15-day window." });
+    container.createDiv({ cls: "sr-empty", text: "No active short-term or long-term projects." });
     return;
   }
 
-  const stageHeight = Math.max(220, Math.min(430, projects.length * 42 + 104));
-  const topPad = 58;
-  const bottomPad = 34;
+  const viewportStageLimit = Math.max(220, Math.min(430, window.innerHeight - 210));
+  const stageHeight = Math.max(220, Math.min(viewportStageLimit, projects.length * 42 + 104));
+  const topPad = stageHeight < 300 ? 52 : 58;
+  const bottomPad = stageHeight < 300 ? 28 : 34;
   const usableHeight = Math.max(80, stageHeight - topPad - bottomPad);
   const centerY = topPad + usableHeight / 2;
   const laneGap = projects.length <= 1 ? 0 : Math.min(42, usableHeight / (projects.length - 1));
@@ -5247,19 +5348,22 @@ function renderProjectTimelineMatrix(container, plugin, state) {
     guide.setAttribute("class", date === todayYmd() ? "sr-pulse-guide is-today" : "sr-pulse-guide");
     svg.appendChild(guide);
 
-    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    text.setAttribute("x", String(x));
-    text.setAttribute("y", "38");
-    text.setAttribute("text-anchor", "middle");
-    text.setAttribute("class", "sr-pulse-date-label");
-    text.textContent = dateLabel(date);
-    svg.appendChild(text);
+    if (dayWidth >= 48 || index % 2 === 0 || date === todayYmd()) {
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("x", String(x));
+      text.setAttribute("y", "38");
+      text.setAttribute("text-anchor", "middle");
+      text.setAttribute("class", "sr-pulse-date-label");
+      text.textContent = dayWidth < 58 ? date.slice(5).replace("-", "/") : dateLabel(date);
+      svg.appendChild(text);
+    }
   }
 
   const overlays = stage.createDiv({ cls: "sr-pulse-stage-overlays" });
   overlays.style.width = `${stageWidth}px`;
   overlays.style.height = `${stageHeight}px`;
   const dropTargets = [];
+  const nodeHover = overlays.createDiv({ cls: "sr-pulse-node-hover" });
   stage._pulseDropContext = {
     rangeStart: range.start,
     dates,
@@ -5272,6 +5376,7 @@ function renderProjectTimelineMatrix(container, plugin, state) {
   projects.forEach((project, projectIndex) => {
     const y = yForLane(projectIndex);
     const type = normalizeProjectType(project.type);
+    const buckets = buildProjectDateBuckets(repository, project, range.start, range.end);
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     path.setAttribute("d", pathForLane(y));
     path.setAttribute("fill", "none");
@@ -5282,29 +5387,6 @@ function renderProjectTimelineMatrix(container, plugin, state) {
     path.setAttribute("class", `sr-pulse-track-path is-${projectTypeClass(project.type)}`);
     svg.appendChild(path);
 
-    if (type === "long-term") {
-      const buckets = buildProjectDateBuckets(repository, project, range.start, range.end);
-      const label = overlays.createDiv({ cls: "sr-pulse-long-label", text: project.name });
-      label.style.left = `${leftPad}px`;
-      label.style.top = `${y - 30}px`;
-      label.style.setProperty("--project-color", project.color);
-      for (const bucket of buckets.values()) {
-        const index = dates.indexOf(bucket.date);
-        if (index === -1) continue;
-        const node = overlays.createDiv({ cls: "sr-pulse-long-node" });
-        const hours = bucket.minutes / 60;
-        const radius = Math.max(4, Math.min(14, 4 + hours * 3.2));
-        const size = radius * 2;
-        node.style.left = `${xForDate(bucket.date)}px`;
-        node.style.top = `${y}px`;
-        node.style.width = `${size}px`;
-        node.style.height = `${size}px`;
-        node.style.setProperty("--project-color", project.color);
-        node.setAttr("title", `${project.name}\n${bucket.date}\n${durationLabelFromMinutes(bucket.minutes)}\n${bucket.count} records`);
-      }
-      return;
-    }
-
     dropTargets.push({ projectId: project.id, projectName: project.name, color: project.color, y });
     const slot = overlays.createDiv({ cls: "sr-pulse-short-slot" });
     slot.style.left = `${leftPad}px`;
@@ -5312,7 +5394,7 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       slot.style.width = `${dayCount * dayWidth}px`;
       slot.style.height = "32px";
     slot.style.setProperty("--project-color", project.color);
-    slot.setAttr("title", `${project.name}\nDrop module here`);
+    slot.setAttr("title", `${project.name}\nDrop plan here`);
     slot.createSpan({ cls: "sr-pulse-slot-label", text: project.name });
     const slotCells = slot.createDiv({ cls: "sr-pulse-slot-cells" });
     slotCells.style.setProperty("--day-count", String(dayCount));
@@ -5334,11 +5416,9 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       block.style.width = `${blockWidth}px`;
       block.style.height = "26px";
       block.style.setProperty("--project-color", project.color);
-      block.setAttr("title", `${project.name}\n${module.name}\n${module.startDate} → ${module.endDate}\nClick: toggle done\nDouble click: rename\nDrag edges: resize`);
+      block.setAttr("title", `${project.name}\n${module.name}\n${module.startDate} → ${module.endDate}\nClick: toggle done\nDouble click: rename\nDrag body: move\nDrag edges: resize`);
       const leftHandle = block.createSpan({ cls: "sr-pulse-module-handle is-left" });
       block.createSpan({ cls: "sr-pulse-module-name", text: module.name });
-      block.createSpan({ cls: "sr-pulse-module-range", text: `${visibleStart.slice(5)}-${visibleEnd.slice(5)}` });
-      block.createSpan({ cls: "sr-pulse-module-check", text: module.done ? "Done" : "" });
       const rightHandle = block.createSpan({ cls: "sr-pulse-module-handle is-right" });
       let clickTimer = 0;
       block.addEventListener("click", (event) => {
@@ -5354,7 +5434,7 @@ function renderProjectTimelineMatrix(container, plugin, state) {
             await repository.updateTimelineModuleAndPersist(module.id, { ...module, done: !module.done });
             renderProjectTimelineMatrix(container, plugin, state);
           } catch (error) {
-            new Notice(error instanceof Error ? error.message : "Failed to update module.");
+            new Notice(error instanceof Error ? error.message : "Failed to update plan.");
           }
         }, 320);
       });
@@ -5366,8 +5446,44 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       });
       attachPulseModuleResize(block, leftHandle, plugin, module, "left", () => renderProjectTimelineMatrix(container, plugin, state));
       attachPulseModuleResize(block, rightHandle, plugin, module, "right", () => renderProjectTimelineMatrix(container, plugin, state));
+      attachPulseModuleMove(block, plugin, module, () => renderProjectTimelineMatrix(container, plugin, state));
     };
     for (const module of modules) renderModuleBlock(module);
+
+    for (const bucket of buckets.values()) {
+      const index = dates.indexOf(bucket.date);
+      if (index === -1) continue;
+      const node = overlays.createDiv({ cls: "sr-pulse-long-node" });
+      const hours = bucket.minutes / 60;
+      const radius = Math.max(4, Math.min(14, 4 + hours * 3.2));
+      const size = radius * 2;
+      node.style.left = `${xForDate(bucket.date)}px`;
+      node.style.top = `${y}px`;
+      node.style.width = `${size}px`;
+      node.style.height = `${size}px`;
+      node.style.setProperty("--project-color", project.color);
+      node.setAttr("aria-label", `${project.name}, ${bucket.date}, ${durationLabelFromMinutes(bucket.minutes)}`);
+      node.addEventListener("mouseenter", () => {
+        nodeHover.empty();
+        const head = nodeHover.createDiv({ cls: "sr-pulse-node-hover-head" });
+        head.createEl("strong", { text: project.name });
+        head.createSpan({ text: `${bucket.date} · ${durationLabelFromMinutes(bucket.minutes)}` });
+        for (const detail of pulseEntryDetailLines(project, bucket.entries)) {
+          const row = nodeHover.createDiv({ cls: "sr-pulse-node-hover-row" });
+          row.createDiv({ cls: "sr-pulse-node-hover-time", text: `${detail.time} · ${detail.duration}` });
+          if (detail.values) row.createDiv({ cls: "sr-pulse-node-hover-values", text: detail.values });
+        }
+        const hoverWidth = 280;
+        const hoverLeft = Math.max(8, Math.min(stageWidth - hoverWidth - 8, xForDate(bucket.date) + 14));
+        const hoverTop = y > stageHeight / 2
+          ? Math.max(48, y - 168)
+          : Math.max(48, Math.min(stageHeight - 168, y + 18));
+        nodeHover.style.left = `${hoverLeft}px`;
+        nodeHover.style.top = `${hoverTop}px`;
+        nodeHover.addClass("is-visible");
+      });
+      node.addEventListener("mouseleave", () => nodeHover.removeClass("is-visible"));
+    }
   });
 
 }
@@ -5383,27 +5499,27 @@ class TimelineModuleModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     const repository = this.plugin.repository;
-    const shortProjects = repository
+    const planProjects = repository
       .listProjects()
-      .filter((project, index) => project.type === "short-term" && project.isActive && !isSleepProject(project, index));
+      .filter((project, index) => ["short-term", "long-term"].includes(project.type) && project.isActive && !isSleepProject(project, index));
     contentEl.empty();
-    contentEl.createEl("h2", { text: this.module ? "Edit Timeline Module" : "Add Timeline Module" });
-    if (shortProjects.length === 0) {
-      contentEl.createDiv({ cls: "sr-empty", text: "No active short-term projects available." });
+    contentEl.createEl("h2", { text: this.module ? "Edit Plan" : "Add Plan" });
+    if (planProjects.length === 0) {
+      contentEl.createDiv({ cls: "sr-empty", text: "No active short-term or long-term projects available." });
       return;
     }
     const form = contentEl.createDiv({ cls: "sr-form" });
 
     const projectRow = form.createDiv({ cls: "sr-form-row" });
-    projectRow.createEl("label", { text: "Short-term Project" });
+    projectRow.createEl("label", { text: "Project" });
     const projectSelect = projectRow.createEl("select");
-    for (const project of shortProjects) {
+    for (const project of planProjects) {
       projectSelect.createEl("option", { value: project.id, text: project.name });
     }
-    projectSelect.value = this.module?.projectId || shortProjects[0].id;
+    projectSelect.value = this.module?.projectId || planProjects[0].id;
 
     const nameRow = form.createDiv({ cls: "sr-form-row" });
-    nameRow.createEl("label", { text: "Module Name" });
+    nameRow.createEl("label", { text: "Plan Name" });
     const nameInput = nameRow.createEl("input");
     nameInput.type = "text";
     nameInput.placeholder = "Literature Review";
@@ -5442,7 +5558,7 @@ class TimelineModuleModal extends Modal {
         this.onSaved?.();
       });
     }
-    const saveButton = actions.createEl("button", { text: this.module ? "Save Module" : "Add Module", type: "button" });
+    const saveButton = actions.createEl("button", { text: this.module ? "Save Plan" : "Add Plan", type: "button" });
     saveButton.addClass("mod-cta");
     saveButton.addEventListener("click", async () => {
       try {
@@ -5458,7 +5574,7 @@ class TimelineModuleModal extends Modal {
         this.close();
         this.onSaved?.();
       } catch (error) {
-        new Notice(error instanceof Error ? error.message : "Failed to save module.");
+        new Notice(error instanceof Error ? error.message : "Failed to save plan.");
       }
     });
 
@@ -5487,12 +5603,11 @@ class ProjectTimelineMatrixModal extends Modal {
     const header = contentEl.createDiv({ cls: "sr-matrix-header" });
     const title = header.createDiv();
     title.createEl("h2", { text: "Task Decomposition" });
-    title.createDiv({ cls: "sr-muted", text: "Centered 15-day plan. Short-term modules can be stretched, renamed, and checked off; long-term work appears as nodes." });
+    title.createDiv({ cls: "sr-muted", text: "Plans can be moved, stretched, renamed, and checked off. Daily records appear as time-sized nodes." });
     const controls = header.createDiv({ cls: "sr-matrix-controls" });
-    controls.createDiv({ cls: "sr-matrix-range-pill", text: "15D" });
     const moduleTemplate = controls.createDiv({ cls: "sr-pulse-module-template" });
     moduleTemplate.createSpan({ cls: "sr-pulse-module-template-icon", text: "+" });
-    moduleTemplate.createSpan({ text: "Module" });
+    moduleTemplate.createSpan({ text: "Plan" });
     const body = contentEl.createDiv({ cls: "sr-matrix-scroll" });
 
     const render = () => {
@@ -5501,9 +5616,28 @@ class ProjectTimelineMatrixModal extends Modal {
 
     attachPulseModulePointerDrag(moduleTemplate, this.plugin, body, render);
     render();
+    let lastWidth = Math.round(body.getBoundingClientRect().width);
+    this.resizeObserver = new ResizeObserver((entries) => {
+      const nextWidth = Math.round(entries[0]?.contentRect?.width || body.getBoundingClientRect().width);
+      if (!nextWidth || Math.abs(nextWidth - lastWidth) < 6) return;
+      lastWidth = nextWidth;
+      window.clearTimeout(this.resizeTimer);
+      this.resizeTimer = window.setTimeout(render, 80);
+    });
+    this.resizeObserver.observe(body);
+    this.handleWindowResize = () => {
+      window.clearTimeout(this.resizeTimer);
+      this.resizeTimer = window.setTimeout(render, 80);
+    };
+    window.addEventListener("resize", this.handleWindowResize);
   }
 
   onClose() {
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    if (this.handleWindowResize) window.removeEventListener("resize", this.handleWindowResize);
+    this.handleWindowResize = null;
+    window.clearTimeout(this.resizeTimer);
     this.modalEl?.removeClass("sr-trend-matrix-modal-shell");
     this.contentEl.empty();
   }
