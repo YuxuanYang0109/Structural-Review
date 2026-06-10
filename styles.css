@@ -94,6 +94,18 @@
   transform: translateX(-50%) translateY(0);
 }
 
+.sr-deskpet-speech.is-left {
+  left: auto;
+  right: calc(100% - 8px);
+  top: 50%;
+  bottom: auto;
+  transform: translateX(4px) translateY(-50%);
+}
+
+.sr-deskpet-speech.is-visible.is-left {
+  transform: translateX(0) translateY(-50%);
+}
+
 .sr-deskpet-speech.is-ask {
   width: 280px;
   max-width: min(280px, 80vw);
@@ -207,6 +219,18 @@
   border-bottom: 0;
   border-left: 1px solid var(--sr-border);
   border-top: 1px solid var(--sr-border);
+}
+
+.sr-deskpet-speech.is-left::after {
+  left: auto;
+  right: -6px;
+  top: 50%;
+  bottom: auto;
+  transform: translateY(-50%) rotate(-45deg);
+  border-left: 0;
+  border-top: 0;
+  border-right: 1px solid var(--sr-border);
+  border-bottom: 1px solid var(--sr-border);
 }
 
 .sr-deskpet-debug {
@@ -1276,11 +1300,16 @@
 }
 
 .sr-matrix-scroll {
+  position: relative;
   width: 100%;
   min-width: 0;
   max-height: none;
   overflow: visible;
   padding: 2px;
+}
+
+.sr-matrix-scroll.is-pulse-transitioning {
+  overflow: hidden;
 }
 
 .sr-pulse-stage {
@@ -1299,6 +1328,66 @@
   box-shadow:
     inset 0 0 0 1px rgba(255, 255, 255, 0.026),
     0 10px 26px rgba(0, 0, 0, 0.08);
+  transition:
+    transform 110ms cubic-bezier(.2, .8, .2, 1),
+    opacity 110ms ease;
+  will-change: transform, opacity;
+}
+
+.sr-pulse-stage-transition-copy {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  z-index: 30;
+  margin: 0;
+  pointer-events: none;
+  transition:
+    transform 360ms cubic-bezier(.2, .8, .2, 1),
+    opacity 300ms ease;
+}
+
+.sr-pulse-stage-transition-copy.is-exit-left.is-active {
+  opacity: 0;
+  transform: translateX(-9%);
+}
+
+.sr-pulse-stage-transition-copy.is-exit-right.is-active {
+  opacity: 0;
+  transform: translateX(9%);
+}
+
+.sr-pulse-stage.is-pulse-entering {
+  opacity: 0;
+  transition:
+    transform 360ms cubic-bezier(.2, .8, .2, 1),
+    opacity 300ms ease;
+}
+
+.sr-pulse-stage.is-pulse-entering.from-right {
+  transform: translateX(9%);
+}
+
+.sr-pulse-stage.is-pulse-entering.from-left {
+  transform: translateX(-9%);
+}
+
+.sr-pulse-stage.is-pulse-entering.is-active {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.sr-pulse-stage.is-pulse-entering .sr-pulse-long-node,
+.sr-pulse-stage.is-pulse-entering .sr-pulse-module-block {
+  animation: sr-pulse-item-arrive 340ms cubic-bezier(.2, .8, .2, 1) both;
+}
+
+@keyframes sr-pulse-item-arrive {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 @media (max-width: 900px), (max-height: 700px) {
@@ -1338,6 +1427,11 @@
   inset: 0;
   width: var(--stage-width);
   height: var(--stage-height);
+}
+
+.sr-pulse-date-motion {
+  transform: translateX(var(--pulse-motion-x, 0px));
+  will-change: transform;
 }
 
 .sr-pulse-short-slot {
@@ -1606,15 +1700,15 @@
   background: var(--project-color);
   box-shadow: none;
   cursor: help;
-  transform: translate(-50%, -50%);
+  transform: translate(-50%, -50%) scale(var(--pulse-node-scale, 1));
   transition:
-    transform 120ms ease,
     border-color 120ms ease;
+  will-change: left, top, opacity, transform;
 }
 
 .sr-pulse-long-node:hover {
   border-color: color-mix(in srgb, var(--project-color) 45%, var(--background-primary));
-  transform: translate(-50%, -50%) scale(1.16);
+  transform: translate(-50%, -50%) scale(calc(var(--pulse-node-scale, 1) + 0.16));
 }
 
 .sr-pulse-node-hover {
@@ -1717,7 +1811,14 @@
   background: color-mix(in srgb, var(--project-color) 18%, var(--background-primary));
   box-shadow: none;
   cursor: grab;
-  transform: translateZ(0);
+  touch-action: none;
+  transform:
+    translateX(var(--pulse-motion-x, 0px))
+    translateY(var(--pulse-plan-edge-y, 0px))
+    scaleX(var(--pulse-plan-scale-x, 1))
+    scaleY(var(--pulse-plan-scale-y, 1))
+    translateZ(0);
+  will-change: left, top, opacity, transform;
 }
 
 .sr-pulse-module-block.is-resizing {
@@ -1732,6 +1833,12 @@
   border-color: color-mix(in srgb, var(--project-color) 64%, var(--sr-border));
   background: color-mix(in srgb, var(--project-color) 23%, var(--background-primary));
   opacity: 0.9;
+  transition:
+    left 100ms cubic-bezier(.2, .8, .2, 1),
+    top 100ms cubic-bezier(.2, .8, .2, 1),
+    width 100ms cubic-bezier(.2, .8, .2, 1),
+    background 120ms ease,
+    border-color 120ms ease;
 }
 
 .sr-pulse-module-block.is-done {

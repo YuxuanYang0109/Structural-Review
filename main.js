@@ -2341,6 +2341,7 @@ function renderDeskPetPlatform(root, plugin) {
     speechBubble.removeClass("is-visible");
     speechBubble.removeClass("is-ask");
     speechBubble.removeClass("is-below");
+    speechBubble.removeClass("is-left");
     action = "move";
   };
   const speechIsOpen = () => speechBubble.hasClass("is-visible");
@@ -2360,7 +2361,9 @@ function renderDeskPetPlatform(root, plugin) {
     return closeButton;
   };
   const updateSpeechPlacement = () => {
-    speechBubble.toggleClass("is-below", isGlobalPet && y < 190);
+    const markdownSurface = getMarkdownAnchorSurface();
+    speechBubble.toggleClass("is-left", markdownSurface?.mode === "edit");
+    speechBubble.removeClass("is-below");
   };
   const bindSpeechSave = (element, getContent, source) => {
     element.setAttr("title", "Double click to save");
@@ -2581,7 +2584,7 @@ function renderDeskPetPlatform(root, plugin) {
     const line = anchor?.closest?.(".cm-line");
     return line instanceof Element && surface.editor.contains(line) ? line : null;
   };
-  const anchorFromElement = (element, container, keyPrefix) => {
+  const anchorFromElement = (element, container, keyPrefix, placement = "beside") => {
     if (!(element instanceof Element) || !(container instanceof Element)) return null;
     const rect = element.getBoundingClientRect();
     const containerRect = container.getBoundingClientRect();
@@ -2589,7 +2592,8 @@ function renderDeskPetPlatform(root, plugin) {
     const minX = Math.max(8, containerRect.left + 8);
     const maxX = Math.min(window.innerWidth - petSize - 8, containerRect.right - petSize - 12);
     const targetX = clamp(Math.min(rect.right + 12, maxX), minX, Math.max(minX, window.innerWidth - petSize - 8));
-    const targetY = clamp(rect.top + rect.height / 2 - petSize / 2, 24, Math.max(24, window.innerHeight - petSize - 8));
+    const rawTargetY = placement === "above" ? rect.top - petSize - 4 : rect.top + rect.height / 2 - petSize / 2;
+    const targetY = clamp(rawTargetY, 24, Math.max(24, window.innerHeight - petSize - 8));
     return {
       x: targetX,
       y: targetY,
@@ -3012,7 +3016,7 @@ function renderDeskPetPlatform(root, plugin) {
         anchorDirty = true;
       }
       if (!lineChanged && anchorTarget && !anchorForceUpdate) return anchorTarget;
-      const target = anchorFromElement(line, surface.container, "edit-line");
+      const target = anchorFromElement(line, surface.container, "edit-line", "above");
       if (target) {
         anchorTarget = target;
         anchorTargetKey = target.key;
@@ -4870,9 +4874,17 @@ function projectHasMatrixPresence(repository, project, rangeStart, rangeEnd) {
   return repository.listEntries(project.id).some((entry) => entry.date >= rangeStart && entry.date <= rangeEnd);
 }
 
-function matrixRangeForMode(mode, repository) {
-  const today = todayYmd();
-  return { start: shiftDays(today, -7), end: shiftDays(today, 7) };
+function signedDaysBetween(startDate, endDate) {
+  const start = parseDateInput(startDate);
+  const end = parseDateInput(endDate);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(0, 0, 0, 0);
+  return Math.round((end.getTime() - start.getTime()) / 86400000);
+}
+
+function matrixRangeForMode(mode, repository, offsetDays = 0) {
+  const center = shiftDays(todayYmd(), Number(offsetDays) || 0);
+  return { start: shiftDays(center, -7), end: shiftDays(center, 7) };
 }
 
 function clampPulseModuleDateRange(dates, startIndex, spanDays = 3) {
@@ -4889,7 +4901,7 @@ function snapPulseModulePointer(stage, clientX, clientY) {
   const inside = clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
   if (!inside) return { inside: false };
 
-  const relativeX = clientX - rect.left;
+  const relativeX = clientX - rect.left - (context.motionOffset || 0);
   const relativeY = clientY - rect.top;
   const slotIndex = Math.round((relativeX - context.leftPad - context.dayWidth / 2) / context.dayWidth);
   const dateIndex = Math.max(0, Math.min(context.dates.length - 1, slotIndex));
@@ -4924,11 +4936,90 @@ function pulseDateIndexFromClientX(stage, clientX) {
   const context = stage?._pulseDropContext;
   if (!context) return 0;
   const rect = stage.getBoundingClientRect();
-  const relativeX = clientX - rect.left;
+  const relativeX = clientX - rect.left - (context.motionOffset || 0);
   return Math.max(0, Math.min(
     context.dates.length - 1,
     Math.floor((relativeX - context.leftPad) / context.dayWidth)
   ));
+}
+
+function updatePulseContinuousMotion(stage, offset = 0) {
+  const context = stage?._pulseDropContext;
+  if (!context) return;
+  const clamp01 = (value) => Math.max(0, Math.min(1, value));
+  const smoothstep = (value) => {
+    const t = clamp01(value);
+    return t * t * (3 - 2 * t);
+  };
+  const edgeVisibility = (progress) => Math.pow(1 - smoothstep(progress), 1.22);
+  context.motionOffset = offset;
+  stage.style.setProperty("--pulse-motion-x", `${offset}px`);
+  const leftEdge = context.leftPad;
+  const rightEdge = context.stageWidth - context.rightPad;
+  const leftEnd = 16;
+  const rightEnd = context.stageWidth - 16;
+
+  for (const node of stage.querySelectorAll(".sr-pulse-long-node[data-pulse-base-x]")) {
+    const baseX = Number(node.dataset.pulseBaseX);
+    const laneY = Number(node.dataset.pulseLaneY);
+    const compressedY = Number(node.dataset.pulseCompressedY);
+    const rawX = baseX + offset;
+    let x = rawX;
+    let y = laneY;
+    let opacity = 1;
+    let scale = 1;
+    if (rawX < leftEdge) {
+      const progress = Math.max(0, Math.min(1, (leftEdge - rawX) / Math.max(1, leftEdge - leftEnd)));
+      const eased = smoothstep(progress);
+      x = leftEdge + (leftEnd - leftEdge) * eased;
+      y = laneY + (compressedY - laneY) * eased;
+      opacity = edgeVisibility(progress);
+      scale = 0.58 + opacity * 0.42;
+    } else if (rawX > rightEdge) {
+      const progress = Math.max(0, Math.min(1, (rawX - rightEdge) / Math.max(1, rightEnd - rightEdge)));
+      const eased = smoothstep(progress);
+      x = rightEdge + (rightEnd - rightEdge) * eased;
+      y = laneY + (compressedY - laneY) * eased;
+      opacity = edgeVisibility(progress);
+      scale = 0.58 + opacity * 0.42;
+    }
+    node.style.left = `${x}px`;
+    node.style.top = `${y}px`;
+    node.style.opacity = String(Math.max(0, opacity));
+    node.style.setProperty("--pulse-node-scale", String(scale));
+    node.style.pointerEvents = opacity > 0.12 ? "auto" : "none";
+  }
+  for (const plan of stage.querySelectorAll(".sr-pulse-module-block[data-pulse-base-left]")) {
+    const baseLeft = Number(plan.dataset.pulseBaseLeft);
+    const width = Number(plan.dataset.pulseWidth);
+    const laneY = Number(plan.dataset.pulseLaneY);
+    const compressedY = Number(plan.dataset.pulseCompressedY);
+    const planLeft = baseLeft + offset;
+    const planRight = planLeft + width;
+    const baseOpacity = plan.classList.contains("is-done") ? 0.72 : 1;
+    const leftProgress = clamp01((leftEdge - planLeft) / Math.max(1, width + leftEdge - leftEnd));
+    const rightProgress = clamp01((planRight - rightEdge) / Math.max(1, width + rightEnd - rightEdge));
+    const progress = Math.max(leftProgress, rightProgress);
+    const eased = smoothstep(progress);
+    const visibility = edgeVisibility(progress);
+    const opacity = baseOpacity * visibility;
+    const edgeY = (compressedY - laneY) * eased * 0.72;
+    plan.style.setProperty("--pulse-plan-edge-y", `${edgeY}px`);
+    plan.style.setProperty("--pulse-plan-scale-x", String(1 - eased * 0.34));
+    plan.style.setProperty("--pulse-plan-scale-y", String(1 - eased * 0.1));
+    plan.style.transformOrigin = leftProgress > rightProgress ? "right center" : rightProgress > 0 ? "left center" : "center";
+    plan.style.opacity = String(Math.max(0, opacity));
+    plan.style.pointerEvents = opacity > 0.12 ? "auto" : "none";
+  }
+  for (const element of stage.querySelectorAll("[data-pulse-presence-min-x]")) {
+    const minX = Number(element.dataset.pulsePresenceMinX) + offset;
+    const maxX = Number(element.dataset.pulsePresenceMaxX) + offset;
+    const baseOpacity = Number(element.dataset.pulseBaseOpacity || 1);
+    let factor = 1;
+    if (maxX < leftEdge) factor = edgeVisibility((leftEdge - maxX) / Math.max(1, leftEdge - leftEnd));
+    if (minX > rightEdge) factor = edgeVisibility((minX - rightEdge) / Math.max(1, rightEnd - rightEdge));
+    element.style.opacity = String(baseOpacity * factor);
+  }
 }
 
 function attachPulseModulePointerDrag(item, plugin, body, rerender) {
@@ -5158,9 +5249,12 @@ function attachPulseModuleMove(block, plugin, module, rerender) {
     ));
     const maxStartIndex = Math.max(0, context.dates.length - durationDays);
     const initialStartIndex = Math.max(0, Math.min(maxStartIndex, daysBetweenExclusive(context.rangeStart, module.startDate)));
+    const initialTarget = context.dropTargets.find((target) => target.projectId === module.projectId) || context.dropTargets[0];
     let startIndex = initialStartIndex;
+    let target = initialTarget;
     let dragging = false;
     let latestX = event.clientX;
+    let latestY = event.clientY;
     let frame = 0;
 
     const applyPreview = () => {
@@ -5168,13 +5262,20 @@ function attachPulseModuleMove(block, plugin, module, rerender) {
       const deltaDays = Math.round((latestX - event.clientX) / context.dayWidth);
       startIndex = Math.max(0, Math.min(maxStartIndex, initialStartIndex + deltaDays));
       const endIndex = startIndex + durationDays - 1;
+      const stageRect = stage.getBoundingClientRect();
+      const relativeY = latestY - stageRect.top;
+      target = context.dropTargets.reduce((nearest, candidate) => (
+        !nearest || Math.abs(relativeY - candidate.y) < Math.abs(relativeY - nearest.y) ? candidate : nearest
+      ), target);
       block.style.left = `${context.leftPad + startIndex * context.dayWidth + 5}px`;
+      block.style.top = `${target.y - 13}px`;
+      block.style.setProperty("--project-color", target.color);
       block.querySelector(".sr-pulse-module-range")?.setText(`${context.dates[startIndex].slice(5)}-${context.dates[endIndex].slice(5)}`);
     };
 
     const onPointerMove = (moveEvent) => {
       if (moveEvent.pointerId !== event.pointerId) return;
-      if (!dragging && Math.abs(moveEvent.clientX - event.clientX) < 4) return;
+      if (!dragging && Math.hypot(moveEvent.clientX - event.clientX, moveEvent.clientY - event.clientY) < 4) return;
       if (!dragging) {
         dragging = true;
         block.dataset.suppressClick = "true";
@@ -5183,6 +5284,7 @@ function attachPulseModuleMove(block, plugin, module, rerender) {
       }
       moveEvent.preventDefault();
       latestX = moveEvent.clientX;
+      latestY = moveEvent.clientY;
       if (!frame) frame = requestAnimationFrame(applyPreview);
     };
 
@@ -5204,6 +5306,7 @@ function attachPulseModuleMove(block, plugin, module, rerender) {
       try {
         await plugin.repository.updateTimelineModuleAndPersist(module.id, {
           ...module,
+          projectId: target.projectId,
           startDate: context.dates[startIndex],
           endDate: context.dates[endIndex],
         });
@@ -5272,13 +5375,15 @@ function openPulseModuleRename(block, plugin, module, rerender) {
 function renderProjectTimelineMatrix(container, plugin, state) {
   const repository = plugin.repository;
   container.empty();
-  const range = matrixRangeForMode(state.rangeMode, repository);
+  const range = matrixRangeForMode(state.rangeMode, repository, state.rangeOffsetDays);
   const dates = dateRangeInclusive(range.start, range.end);
+  const bufferedRange = { start: shiftDays(range.start, -2), end: shiftDays(range.end, 2) };
+  const bufferedDates = dateRangeInclusive(bufferedRange.start, bufferedRange.end);
   const dayCount = Math.max(1, dates.length);
   const measuredWidth = Math.floor(container.getBoundingClientRect().width || container.clientWidth || 0);
   const fallbackWidth = Math.floor(Math.min(1720, window.innerWidth * 0.88));
   const stageWidth = Math.max(360, measuredWidth > 40 ? measuredWidth - 4 : fallbackWidth);
-  const edgePad = Math.max(32, Math.min(48, stageWidth * 0.035));
+  const edgePad = Math.max(44, Math.min(76, stageWidth * 0.05));
   const leftPad = edgePad;
   const rightPad = edgePad;
   const dayWidth = (stageWidth - leftPad - rightPad) / dayCount;
@@ -5288,12 +5393,12 @@ function renderProjectTimelineMatrix(container, plugin, state) {
   const shortProjects = repository
     .listProjects()
     .filter((project, index) => project.isActive && !project.completed && normalizeProjectType(project.type) === "short-term" && !isSleepProject(project, index))
-    .filter((project) => projectHasMatrixPresence(repository, project, range.start, range.end))
+    .filter((project) => projectHasMatrixPresence(repository, project, bufferedRange.start, bufferedRange.end))
     .sort((left, right) => projectMatrixStartDate(left, range.start).localeCompare(projectMatrixStartDate(right, range.start)) || left.name.localeCompare(right.name, "en-US"));
   const longProjects = repository
     .listProjects()
     .filter((project, index) => project.isActive && normalizeProjectType(project.type) === "long-term" && !isDailyStatusProject(project) && !isSleepProject(project, index))
-    .filter((project) => projectHasMatrixPresence(repository, project, range.start, range.end))
+    .filter((project) => projectHasMatrixPresence(repository, project, bufferedRange.start, bufferedRange.end))
     .sort((left, right) => left.name.localeCompare(right.name, "en-US"));
   const projects = [...shortProjects, ...longProjects];
 
@@ -5310,8 +5415,8 @@ function renderProjectTimelineMatrix(container, plugin, state) {
   const centerY = topPad + usableHeight / 2;
   const laneGap = projects.length <= 1 ? 0 : Math.min(42, usableHeight / (projects.length - 1));
   const firstY = projects.length <= 1 ? centerY : centerY - laneGap * (projects.length - 1) / 2;
-  const xForDate = (date) => leftPad + (Math.max(0, Math.min(dayCount - 1, daysBetweenExclusive(range.start, date))) + 0.5) * dayWidth;
-  const xForDateEdge = (date) => leftPad + Math.max(0, Math.min(dayCount, daysBetweenExclusive(range.start, date))) * dayWidth;
+  const xForDate = (date) => leftPad + (signedDaysBetween(range.start, date) + 0.5) * dayWidth;
+  const xForDateEdge = (date) => leftPad + signedDaysBetween(range.start, date) * dayWidth;
   const yForLane = (index) => firstY + laneGap * index;
   const compressedY = (y) => centerY + (y - centerY) * 0.28;
   const pathForLane = (y) => {
@@ -5338,7 +5443,11 @@ function renderProjectTimelineMatrix(container, plugin, state) {
   const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
   svg.appendChild(defs);
 
-  for (const [index, date] of dates.entries()) {
+  const dateMotionGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  dateMotionGroup.setAttribute("class", "sr-pulse-date-motion");
+  svg.appendChild(dateMotionGroup);
+  for (const date of bufferedDates) {
+    const index = signedDaysBetween(range.start, date);
     const x = xForDate(date);
     const guide = document.createElementNS("http://www.w3.org/2000/svg", "line");
     guide.setAttribute("x1", String(x));
@@ -5346,16 +5455,16 @@ function renderProjectTimelineMatrix(container, plugin, state) {
     guide.setAttribute("y1", "58");
     guide.setAttribute("y2", String(stageHeight - 38));
     guide.setAttribute("class", date === todayYmd() ? "sr-pulse-guide is-today" : "sr-pulse-guide");
-    svg.appendChild(guide);
+    dateMotionGroup.appendChild(guide);
 
-    if (dayWidth >= 48 || index % 2 === 0 || date === todayYmd()) {
+    if (dayWidth >= 48 || Math.abs(index) % 2 === 0 || date === todayYmd()) {
       const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
       text.setAttribute("x", String(x));
       text.setAttribute("y", "38");
       text.setAttribute("text-anchor", "middle");
       text.setAttribute("class", "sr-pulse-date-label");
       text.textContent = dayWidth < 58 ? date.slice(5).replace("-", "/") : dateLabel(date);
-      svg.appendChild(text);
+      dateMotionGroup.appendChild(text);
     }
   }
 
@@ -5369,14 +5478,17 @@ function renderProjectTimelineMatrix(container, plugin, state) {
     dates,
     dayWidth,
     leftPad,
+    rightPad,
+    stageWidth,
     dropTargets,
     laneSnapRadius: 28,
+    motionOffset: Number(state.motionOffset) || 0,
   };
 
   projects.forEach((project, projectIndex) => {
     const y = yForLane(projectIndex);
     const type = normalizeProjectType(project.type);
-    const buckets = buildProjectDateBuckets(repository, project, range.start, range.end);
+    const buckets = buildProjectDateBuckets(repository, project, bufferedRange.start, bufferedRange.end);
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     path.setAttribute("d", pathForLane(y));
     path.setAttribute("fill", "none");
@@ -5386,6 +5498,12 @@ function renderProjectTimelineMatrix(container, plugin, state) {
     path.setAttribute("opacity", type === "long-term" ? "0.56" : "0.42");
     path.setAttribute("class", `sr-pulse-track-path is-${projectTypeClass(project.type)}`);
     svg.appendChild(path);
+    const bucketDates = [...buckets.keys()].sort();
+    const presenceMinX = bucketDates.length ? xForDate(bucketDates[0]) : leftPad;
+    const presenceMaxX = bucketDates.length ? xForDate(bucketDates[bucketDates.length - 1]) : leftPad;
+    path.dataset.pulsePresenceMinX = String(presenceMinX);
+    path.dataset.pulsePresenceMaxX = String(presenceMaxX);
+    path.dataset.pulseBaseOpacity = type === "long-term" ? "0.56" : "0.42";
 
     dropTargets.push({ projectId: project.id, projectName: project.name, color: project.color, y });
     const slot = overlays.createDiv({ cls: "sr-pulse-short-slot" });
@@ -5394,6 +5512,9 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       slot.style.width = `${dayCount * dayWidth}px`;
       slot.style.height = "32px";
     slot.style.setProperty("--project-color", project.color);
+    slot.dataset.pulsePresenceMinX = String(presenceMinX);
+    slot.dataset.pulsePresenceMaxX = String(presenceMaxX);
+    slot.dataset.pulseBaseOpacity = "0.58";
     slot.setAttr("title", `${project.name}\nDrop plan here`);
     slot.createSpan({ cls: "sr-pulse-slot-label", text: project.name });
     const slotCells = slot.createDiv({ cls: "sr-pulse-slot-cells" });
@@ -5402,13 +5523,13 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       slotCells.createSpan({ cls: date === todayYmd() ? "is-today" : "" });
     }
 
-    const modules = repository.listTimelineModules(project.id).filter((module) => module.startDate <= range.end && module.endDate >= range.start);
+    const modules = repository.listTimelineModules(project.id).filter((module) => module.startDate <= bufferedRange.end && module.endDate >= bufferedRange.start);
     const renderModuleBlock = (module) => {
-      const visibleStart = module.startDate < range.start ? range.start : module.startDate;
-      const visibleEnd = module.endDate > range.end ? range.end : module.endDate;
-      const startIndex = Math.max(0, Math.min(dayCount - 1, daysBetweenExclusive(range.start, visibleStart)));
-      const endIndex = Math.max(startIndex, Math.min(dayCount - 1, daysBetweenExclusive(range.start, visibleEnd)));
-      const blockLeft = xForDateEdge(visibleStart) + 5;
+      const visibleStart = module.startDate < bufferedRange.start ? bufferedRange.start : module.startDate;
+      const visibleEnd = module.endDate > bufferedRange.end ? bufferedRange.end : module.endDate;
+      const startIndex = signedDaysBetween(range.start, visibleStart);
+      const endIndex = Math.max(startIndex, signedDaysBetween(range.start, visibleEnd));
+      const blockLeft = leftPad + startIndex * dayWidth + 5;
       const blockWidth = Math.max(36, (endIndex - startIndex + 1) * dayWidth - 10);
       const block = overlays.createDiv({ cls: module.done ? "sr-pulse-module-block is-done" : "sr-pulse-module-block" });
       block.style.left = `${blockLeft}px`;
@@ -5416,6 +5537,11 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       block.style.width = `${blockWidth}px`;
       block.style.height = "26px";
       block.style.setProperty("--project-color", project.color);
+      block.style.setProperty("--pulse-base-left", `${blockLeft}px`);
+      block.dataset.pulseBaseLeft = String(blockLeft);
+      block.dataset.pulseWidth = String(blockWidth);
+      block.dataset.pulseLaneY = String(y);
+      block.dataset.pulseCompressedY = String(compressedY(y));
       block.setAttr("title", `${project.name}\n${module.name}\n${module.startDate} → ${module.endDate}\nClick: toggle done\nDouble click: rename\nDrag body: move\nDrag edges: resize`);
       const leftHandle = block.createSpan({ cls: "sr-pulse-module-handle is-left" });
       block.createSpan({ cls: "sr-pulse-module-name", text: module.name });
@@ -5451,8 +5577,6 @@ function renderProjectTimelineMatrix(container, plugin, state) {
     for (const module of modules) renderModuleBlock(module);
 
     for (const bucket of buckets.values()) {
-      const index = dates.indexOf(bucket.date);
-      if (index === -1) continue;
       const node = overlays.createDiv({ cls: "sr-pulse-long-node" });
       const hours = bucket.minutes / 60;
       const radius = Math.max(4, Math.min(14, 4 + hours * 3.2));
@@ -5462,6 +5586,9 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       node.style.width = `${size}px`;
       node.style.height = `${size}px`;
       node.style.setProperty("--project-color", project.color);
+      node.dataset.pulseBaseX = String(xForDate(bucket.date));
+      node.dataset.pulseLaneY = String(y);
+      node.dataset.pulseCompressedY = String(compressedY(y));
       node.setAttr("aria-label", `${project.name}, ${bucket.date}, ${durationLabelFromMinutes(bucket.minutes)}`);
       node.addEventListener("mouseenter", () => {
         nodeHover.empty();
@@ -5474,7 +5601,7 @@ function renderProjectTimelineMatrix(container, plugin, state) {
           if (detail.values) row.createDiv({ cls: "sr-pulse-node-hover-values", text: detail.values });
         }
         const hoverWidth = 280;
-        const hoverLeft = Math.max(8, Math.min(stageWidth - hoverWidth - 8, xForDate(bucket.date) + 14));
+        const hoverLeft = Math.max(8, Math.min(stageWidth - hoverWidth - 8, xForDate(bucket.date) + (Number(state.motionOffset) || 0) + 14));
         const hoverTop = y > stageHeight / 2
           ? Math.max(48, y - 168)
           : Math.max(48, Math.min(stageHeight - 168, y + 18));
@@ -5485,7 +5612,43 @@ function renderProjectTimelineMatrix(container, plugin, state) {
       node.addEventListener("mouseleave", () => nodeHover.removeClass("is-visible"));
     }
   });
+  updatePulseContinuousMotion(stage, Number(state.motionOffset) || 0);
 
+}
+
+function renderProjectTimelineMatrixAnimated(container, plugin, state, direction = 0) {
+  const previous = direction ? container.querySelector(".sr-pulse-stage") : null;
+  const previousClone = previous?.cloneNode(true) || null;
+  if (previousClone) {
+    previousClone.style.transform = "";
+    previousClone.style.opacity = "";
+  }
+  if (previous) {
+    previous.style.transform = "";
+    previous.style.opacity = "";
+  }
+  renderProjectTimelineMatrix(container, plugin, state);
+  const next = container.querySelector(".sr-pulse-stage");
+  if (!previousClone || !next || !direction) return;
+
+  container.addClass("is-pulse-transitioning");
+  previousClone.classList.add("sr-pulse-stage-transition-copy", direction > 0 ? "is-exit-left" : "is-exit-right");
+  next.classList.add("is-pulse-entering", direction > 0 ? "from-right" : "from-left");
+  container.appendChild(previousClone);
+
+  requestAnimationFrame(() => {
+    previousClone.classList.add("is-active");
+    next.classList.add("is-active");
+  });
+
+  window.setTimeout(() => {
+    previousClone.remove();
+    next.removeClass("is-pulse-entering");
+    next.removeClass("from-right");
+    next.removeClass("from-left");
+    next.removeClass("is-active");
+    container.removeClass("is-pulse-transitioning");
+  }, 380);
 }
 
 class TimelineModuleModal extends Modal {
@@ -5592,6 +5755,8 @@ class ProjectTimelineMatrixModal extends Modal {
     this.plugin = plugin;
     this.state = {
       types: new Set(["long-term", "short-term", "temporary"]),
+      rangeOffsetDays: 0,
+      motionOffset: 0,
     };
   }
 
@@ -5616,6 +5781,36 @@ class ProjectTimelineMatrixModal extends Modal {
 
     attachPulseModulePointerDrag(moduleTemplate, this.plugin, body, render);
     render();
+    this.handleTimelineWheel = (event) => {
+      if (event.ctrlKey || event.metaKey) return;
+      event.preventDefault();
+      const delta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+      this.pendingWheelDelta = (this.pendingWheelDelta || 0) + delta;
+      if (this.wheelFrame) return;
+      this.wheelFrame = requestAnimationFrame(() => {
+        this.wheelFrame = 0;
+        const wheelDelta = this.pendingWheelDelta || 0;
+        this.pendingWheelDelta = 0;
+        const stage = body.querySelector(".sr-pulse-stage");
+        const context = stage?._pulseDropContext;
+        if (!stage || !context) return;
+        this.state.motionOffset -= wheelDelta * 0.52;
+        let recycled = false;
+        while (this.state.motionOffset <= -context.dayWidth) {
+          this.state.motionOffset += context.dayWidth;
+          this.state.rangeOffsetDays += 1;
+          recycled = true;
+        }
+        while (this.state.motionOffset >= context.dayWidth) {
+          this.state.motionOffset -= context.dayWidth;
+          this.state.rangeOffsetDays -= 1;
+          recycled = true;
+        }
+        if (recycled) render();
+        else updatePulseContinuousMotion(stage, this.state.motionOffset);
+      });
+    };
+    body.addEventListener("wheel", this.handleTimelineWheel, { passive: false });
     let lastWidth = Math.round(body.getBoundingClientRect().width);
     this.resizeObserver = new ResizeObserver((entries) => {
       const nextWidth = Math.round(entries[0]?.contentRect?.width || body.getBoundingClientRect().width);
@@ -5637,6 +5832,10 @@ class ProjectTimelineMatrixModal extends Modal {
     this.resizeObserver = null;
     if (this.handleWindowResize) window.removeEventListener("resize", this.handleWindowResize);
     this.handleWindowResize = null;
+    if (this.handleTimelineWheel) this.contentEl.querySelector(".sr-matrix-scroll")?.removeEventListener("wheel", this.handleTimelineWheel);
+    this.handleTimelineWheel = null;
+    if (this.wheelFrame) cancelAnimationFrame(this.wheelFrame);
+    this.wheelFrame = 0;
     window.clearTimeout(this.resizeTimer);
     this.modalEl?.removeClass("sr-trend-matrix-modal-shell");
     this.contentEl.empty();
