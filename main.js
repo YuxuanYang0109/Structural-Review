@@ -19,7 +19,7 @@ const {
 const VIEW_TYPE = "structured-review-view";
 const TEMPORARY_ARCHIVE_ID = "__temporary_archive__";
 const REPORT_ROOT = "StructuredReview/reports";
-const DEFAULT_DATA = { version: 2, projects: [], entries: [], timelineModules: [], settings: {} };
+const DEFAULT_DATA = { version: 3, projects: [], entries: [], timelineModules: [], citeReviews: [], settings: {} };
 const DEFAULT_SETTINGS = {
   deepseekApiKey: "",
   deepseekModel: "deepseek-chat",
@@ -70,6 +70,7 @@ const DAILY_REVIEW_END_HOUR = 23;
 const DAILY_SLEEP_START_HOUR = 0;
 const DAILY_SLEEP_END_HOUR = 24;
 const DAILY_TIMELINE_SLOT_HEIGHT = 42;
+const CITE_REVIEW_INTERVALS = [1, 2, 4, 7, 15, 30, 60];
 
 function normalizeSettings(settings) {
   const source = settings && typeof settings === "object" ? settings : {};
@@ -110,6 +111,12 @@ function ymd(date) {
 function parseDateInput(dateString) {
   const [year, month, day] = String(dateString || "").split("-").map(Number);
   return new Date(year, (month || 1) - 1, day || 1);
+}
+
+function shiftDateDays(dateString, amount) {
+  const date = parseDateInput(dateString);
+  date.setDate(date.getDate() + Number(amount || 0));
+  return ymd(date);
 }
 
 function monthKeyFromDate(dateString = todayYmd()) {
@@ -637,6 +644,26 @@ function normalizeTimelineModule(module, index = 0) {
   };
 }
 
+function normalizeCiteReview(review) {
+  const stage = Number(review?.stage);
+  const history = Array.isArray(review?.history)
+    ? review.history.slice(-80).map((item) => ({
+      date: String(item?.date || "").slice(0, 10),
+      rating: ["remembered", "fuzzy", "forgotten"].includes(item?.rating) ? item.rating : "fuzzy",
+      reviewedAt: String(item?.reviewedAt || nowIso()),
+    })).filter((item) => item.date)
+    : [];
+  return {
+    path: normalizePath(String(review?.path || "")),
+    stage: Number.isFinite(stage) ? Math.max(-1, Math.min(CITE_REVIEW_INTERVALS.length - 1, Math.round(stage))) : -1,
+    nextReview: String(review?.nextReview || todayYmd()).slice(0, 10),
+    lastReview: String(review?.lastReview || "").slice(0, 10),
+    lastRating: ["remembered", "fuzzy", "forgotten"].includes(review?.lastRating) ? review.lastRating : "",
+    reviewCount: Math.max(0, Number(review?.reviewCount) || history.length),
+    history,
+  };
+}
+
 function validateTimelineModuleInput(input) {
   const name = String(input?.name || "").trim();
   const projectId = String(input?.projectId || "").trim();
@@ -655,10 +682,11 @@ class Repository {
     this.listeners = new Set();
     const source = data && typeof data === "object" ? data : DEFAULT_DATA;
     this.data = {
-      version: 2,
+      version: 3,
       projects: Array.isArray(source.projects) ? source.projects.map(normalizeProject) : [],
       entries: Array.isArray(source.entries) ? source.entries.map(normalizeEntry) : [],
       timelineModules: Array.isArray(source.timelineModules) ? source.timelineModules.map(normalizeTimelineModule) : [],
+      citeReviews: Array.isArray(source.citeReviews) ? source.citeReviews.map(normalizeCiteReview).filter((review) => review.path) : [],
       settings: normalizeSettings(source.settings),
     };
   }
@@ -800,6 +828,47 @@ class Repository {
 
   getTimelineModule(moduleId) {
     return (this.data.timelineModules || []).find((module) => module.id === moduleId) || null;
+  }
+
+  getCiteReview(path) {
+    const normalizedPath = normalizePath(String(path || ""));
+    return (this.data.citeReviews || []).find((review) => review.path === normalizedPath) || null;
+  }
+
+  async reviewCiteCardAndPersist(path, rating, reviewDate = todayYmd()) {
+    const normalizedPath = normalizePath(String(path || ""));
+    if (!normalizedPath) throw new Error("Card path is required.");
+    if (!["remembered", "fuzzy", "forgotten"].includes(rating)) throw new Error("Unknown memory rating.");
+    const date = String(reviewDate || todayYmd()).slice(0, 10);
+    let review = this.getCiteReview(normalizedPath);
+    if (!review) {
+      review = normalizeCiteReview({ path: normalizedPath, stage: -1, nextReview: date });
+      this.data.citeReviews = [...(this.data.citeReviews || []), review];
+    }
+    let nextStage = review.stage;
+    let intervalDays = 1;
+    if (rating === "remembered") {
+      nextStage = Math.min(CITE_REVIEW_INTERVALS.length - 1, review.stage + 1);
+      intervalDays = CITE_REVIEW_INTERVALS[Math.max(0, nextStage)];
+    } else if (rating === "fuzzy") {
+      nextStage = Math.max(-1, review.stage - 1);
+      intervalDays = 1;
+    } else {
+      nextStage = -1;
+      intervalDays = 1;
+    }
+    const reviewedAt = nowIso();
+    Object.assign(review, {
+      stage: nextStage,
+      nextReview: shiftDateDays(date, intervalDays),
+      lastReview: date,
+      lastRating: rating,
+      reviewCount: review.reviewCount + 1,
+      history: [...review.history, { date, rating, reviewedAt }].slice(-80),
+    });
+    this.notify();
+    await this.persist();
+    return review;
   }
 
   createTimelineModule(input) {
@@ -1771,13 +1840,25 @@ function renderDeskPet(root, plugin) {
   const petSize = 92;
   const sprites = {
     jumpUp: getPluginAssetUrl(plugin, "deskpet-jump-up.png"),
+    jumpMidUp: getPluginAssetUrl(plugin, "deskpet-jump-mid-up.png"),
     jumpDown: getPluginAssetUrl(plugin, "deskpet-jump-down.png"),
+    jumpMidDown: getPluginAssetUrl(plugin, "deskpet-jump-mid-down.png"),
     walkA: getPluginAssetUrl(plugin, "deskpet-walk-a.png"),
     walkB: getPluginAssetUrl(plugin, "deskpet-walk-b.png"),
+    walkC: getPluginAssetUrl(plugin, "deskpet-walk-c.png"),
+    walkD: getPluginAssetUrl(plugin, "deskpet-walk-d.png"),
     read: getPluginAssetUrl(plugin, "deskpet-read.png"),
+    readPageA: getPluginAssetUrl(plugin, "deskpet-read-page-a.png"),
+    readPageB: getPluginAssetUrl(plugin, "deskpet-read-page-b.png"),
     game: getPluginAssetUrl(plugin, "deskpet-game.png"),
+    gameA: getPluginAssetUrl(plugin, "deskpet-game-a.png"),
+    gameB: getPluginAssetUrl(plugin, "deskpet-game-b.png"),
     sleep: getPluginAssetUrl(plugin, "deskpet-sleep.png"),
-    held: getPluginAssetUrl(plugin, "deskpet-held.png"),
+    sleepA: getPluginAssetUrl(plugin, "deskpet-sleep-a.png"),
+    sleepB: getPluginAssetUrl(plugin, "deskpet-sleep-b.png"),
+    held: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
+    heldA: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
+    heldB: getPluginAssetUrl(plugin, "deskpet-held-b.png"),
   };
   const pet = root.createDiv({ cls: "sr-deskpet" });
   const img = pet.createEl("img", {
@@ -2106,7 +2187,8 @@ function renderDeskPet(root, plugin) {
   window.addEventListener("pointercancel", cancelPetDrag);
   const tick = (now = performance.now()) => {
     if (isDraggingPet) {
-      setImagePose("held", direction, Math.sin(now / 180) * 1.5, Math.sin(now / 230) * 2.5);
+      const heldFrame = Math.floor(now / 170) % 6;
+      setImagePose("held", direction, [0.8, 1.4, 1.8, 1.2, 0.4, 0][heldFrame], [-2.5, -1.2, 0.8, 2.5, 1.1, -0.8][heldFrame], heldFrame);
       frame = requestAnimationFrame(tick);
       return;
     }
@@ -2222,14 +2304,31 @@ function renderDeskPetPlatform(root, plugin) {
   };
   const sprites = {
     jumpUp: getPluginAssetUrl(plugin, "deskpet-jump-up.png"),
+    jumpMidUp: getPluginAssetUrl(plugin, "deskpet-jump-mid-up.png"),
     jumpDown: getPluginAssetUrl(plugin, "deskpet-jump-down.png"),
+    jumpMidDown: getPluginAssetUrl(plugin, "deskpet-jump-mid-down.png"),
     walkA: getPluginAssetUrl(plugin, "deskpet-walk-a.png"),
     walkB: getPluginAssetUrl(plugin, "deskpet-walk-b.png"),
+    walkC: getPluginAssetUrl(plugin, "deskpet-walk-c.png"),
+    walkD: getPluginAssetUrl(plugin, "deskpet-walk-d.png"),
     read: getPluginAssetUrl(plugin, "deskpet-read.png"),
+    readPageA: getPluginAssetUrl(plugin, "deskpet-read-page-a.png"),
+    readPageB: getPluginAssetUrl(plugin, "deskpet-read-page-b.png"),
     game: getPluginAssetUrl(plugin, "deskpet-game.png"),
+    gameA: getPluginAssetUrl(plugin, "deskpet-game-a.png"),
+    gameB: getPluginAssetUrl(plugin, "deskpet-game-b.png"),
     sleep: getPluginAssetUrl(plugin, "deskpet-sleep.png"),
-    held: getPluginAssetUrl(plugin, "deskpet-held.png"),
+    sleepA: getPluginAssetUrl(plugin, "deskpet-sleep-a.png"),
+    sleepB: getPluginAssetUrl(plugin, "deskpet-sleep-b.png"),
+    held: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
+    heldA: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
+    heldB: getPluginAssetUrl(plugin, "deskpet-held-b.png"),
   };
+  for (const source of new Set(Object.values(sprites))) {
+    const preload = new Image();
+    preload.decoding = "async";
+    preload.src = source;
+  }
   const pet = root.createDiv({ cls: isGlobalPet ? "sr-deskpet is-global" : "sr-deskpet" });
   pet.setAttr("title", "Shift + double click: toggle platform debug");
   const img = pet.createEl("img", { attr: { alt: "", src: sprites.jumpDown, draggable: "false" } });
@@ -2313,11 +2412,13 @@ function renderDeskPetPlatform(root, plugin) {
     img.src = sprites[key] || sprites.jumpDown;
     lastSprite = key;
   };
-  const setImagePose = (key, facing = direction, lift = 0, rotate = 0) => {
+  const setImagePose = (key, facing = direction, lift = 0, rotate = 0, poseFrame = 0) => {
     setSprite(key);
-    const poseScale = key === "held" ? 1.2 : 1;
-    img.style.transform = `scaleX(${facing >= 0 ? 1 : -1}) scale(${poseScale}) translateY(${lift}px) rotate(${rotate}deg)`;
+    img.style.transform = `scaleX(${facing >= 0 ? 1 : -1}) translateY(${lift}px) rotate(${rotate}deg)`;
+    pet.dataset.pose = key;
+    pet.dataset.poseFrame = String(Math.max(0, Math.min(5, poseFrame)));
   };
+  const readFrameSprite = (frameIndex) => ["read", "read", "readPageA", "readPageB", "read", "read"][frameIndex] || "read";
   const applyPetTransform = () => {
     pet.style.transform = `translate3d(${x}px, ${y}px, 0)`;
   };
@@ -2549,10 +2650,27 @@ function renderDeskPetPlatform(root, plugin) {
     return rect.right >= rootRect.left - 80 && rect.left <= rootRect.right + 80;
   };
   const classLabel = (element) => Array.from(element?.classList || []).slice(0, 3).join(".");
+  const getTopVisibleModal = () => {
+    if (!isGlobalPet) return null;
+    const visibleModals = Array.from(document.querySelectorAll(".modal-container .modal")).filter((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight;
+    });
+    return visibleModals[visibleModals.length - 1] || null;
+  };
   const getActiveSurfaceRoot = () => {
+    const activeModal = getTopVisibleModal();
+    if (activeModal) return activeModal;
     const activeContainer = plugin.app?.workspace?.activeLeaf?.view?.containerEl;
     if (activeContainer instanceof Element) return activeContainer;
     return root;
+  };
+  const syncPetLayer = () => {
+    if (!isGlobalPet) return;
+    const activeModal = getTopVisibleModal();
+    const host = activeModal?.closest(".modal-container") || root;
+    if (pet.parentElement !== host) host.appendChild(pet);
+    if (debugLayer.parentElement !== host) host.appendChild(debugLayer);
   };
   const markdownBlockSelector = ".markdown-preview-view h1, .markdown-preview-view h2, .markdown-preview-view h3, .markdown-preview-view h4, .markdown-preview-view p, .markdown-preview-view li, .markdown-preview-view blockquote, .markdown-preview-view pre, .markdown-preview-view table, .markdown-preview-view img";
   const getMarkdownAnchorSurface = () => {
@@ -2602,6 +2720,7 @@ function renderDeskPetPlatform(root, plugin) {
     };
   };
   const getMutationRoot = () => {
+    if (isGlobalPet) return document.body;
     const surfaceRoot = getActiveSurfaceRoot();
     return surfaceRoot instanceof Element ? surfaceRoot : root;
   };
@@ -2614,7 +2733,7 @@ function renderDeskPetPlatform(root, plugin) {
     const surfaceRoot = getActiveSurfaceRoot();
     if (!(surfaceRoot instanceof Element)) return;
     rememberScrollState(surfaceRoot);
-    surfaceRoot.querySelectorAll(".markdown-preview-view, .cm-scroller, .workspace-leaf-content, .structured-review-view").forEach(rememberScrollState);
+    surfaceRoot.querySelectorAll(".markdown-preview-view, .cm-scroller, .workspace-leaf-content, .structured-review-view, .modal-content, .sr-matrix-scroll, .sr-date-review-left, .sr-date-review-right").forEach(rememberScrollState);
   };
   const observeActiveSurface = (observer) => {
     const nextRoot = isGlobalPet ? getMutationRoot() : root;
@@ -2675,6 +2794,11 @@ function renderDeskPetPlatform(root, plugin) {
     };
 
     surfaceRoot.querySelectorAll([
+      ".modal-content",
+      ".sr-date-review-left",
+      ".sr-date-review-right",
+      ".sr-matrix-scroll",
+      ".sr-pulse-stage",
       ".sr-overview-hero",
       ".sr-overview-trend-panel",
       ".sr-calendar-panel",
@@ -2684,6 +2808,9 @@ function renderDeskPetPlatform(root, plugin) {
     ].join(",")).forEach((element) => addTopEdge(element, "panel-top", 18));
 
     surfaceRoot.querySelectorAll([
+      ".sr-pulse-row",
+      ".sr-day-timeline-rail",
+      ".sr-date-project-card",
       ".sr-project-card",
       ".sr-overview-card",
       ".sr-stat-card",
@@ -2960,11 +3087,13 @@ function renderDeskPetPlatform(root, plugin) {
   };
   const playSettle = (now) => {
     const progress = clamp(1 - ((settleUntil - now) / 260), 0, 1);
-    const frame = Math.min(3, Math.floor(progress * 4));
-    const lifts = settleMoveType === "jump" ? [-2.5, 1.8, -0.8, 0] : [-1.2, 0.8, -0.4, 0];
-    const rotates = settleMoveType === "jump" ? [3, -2, 1, 0] : [1, -1, 0.5, 0];
-    const sprite = settleMoveType === "jump" && frame < 2 ? "jumpDown" : "walkA";
-    setImagePose(sprite, direction, lifts[frame], rotates[frame]);
+    const poseFrame = Math.min(5, Math.floor(progress * 6));
+    const lifts = settleMoveType === "jump" ? [-2.5, 1.8, 1.1, -0.8, -0.3, 0] : [-1.2, 0.8, 0.3, -0.4, -0.2, 0];
+    const rotates = settleMoveType === "jump" ? [3, -2, -1, 1, 0.5, 0] : [1, -1, -0.4, 0.5, 0.2, 0];
+    const sprite = settleMoveType === "jump"
+      ? ["jumpMidDown", "jumpDown", "jumpDown", "walkC", "walkA", "walkA"][poseFrame]
+      : ["walkC", "walkA", "walkD", "walkA", "walkC", "walkA"][poseFrame];
+    setImagePose(sprite, direction, lifts[poseFrame], rotates[poseFrame], poseFrame);
     applyPetTransform();
   };
   const startMove = (from, to, edge, now) => {
@@ -2987,11 +3116,11 @@ function renderDeskPetPlatform(root, plugin) {
     y = activeMove.from.y + (activeMove.to.y - activeMove.from.y) * progress;
     if (activeMove.edge.type === "jump") {
       y -= Math.sin(progress * Math.PI) * activeMove.arc;
-      const jumpFrame = Math.min(3, Math.floor(progress * 4));
-      setImagePose(["jumpUp", "jumpUp", "jumpDown", "jumpDown"][jumpFrame], direction, 0, [-4, -1, 2, 4][jumpFrame]);
+      const jumpFrame = Math.min(5, Math.floor(progress * 6));
+      setImagePose(["jumpUp", "jumpMidUp", "jumpUp", "jumpDown", "jumpMidDown", "jumpDown"][jumpFrame], direction, 0, [-4, -2, -0.5, 1.5, 3, 4][jumpFrame], jumpFrame);
     } else {
-      const walkFrame = Math.floor(now / 180) % 4;
-      setImagePose(["walkA", "walkA", "walkB", "walkB"][walkFrame], direction, [0, -1.4, -0.5, -1.8][walkFrame], [-1, 0, 1, 0][walkFrame]);
+      const walkFrame = Math.floor(now / 165) % 6;
+      setImagePose(["walkA", "walkC", "walkB", "walkD", "walkA", "walkD"][walkFrame], direction, [0, -1.2, -0.5, -1.7, -0.8, -1.3][walkFrame], [-1, -0.3, 0.8, 0.2, -0.5, 0.5][walkFrame], walkFrame);
     }
     if (progress >= 1) {
       x = activeMove.to.x;
@@ -3081,11 +3210,11 @@ function renderDeskPetPlatform(root, plugin) {
     y = anchorMove.from.y + (anchorMove.to.y - anchorMove.from.y) * progress;
     if (anchorMove.type === "jump") {
       y -= Math.sin(progress * Math.PI) * anchorMove.arc;
-      const jumpFrame = Math.min(3, Math.floor(progress * 4));
-      setImagePose(["jumpUp", "jumpUp", "jumpDown", "jumpDown"][jumpFrame], direction, 0, [-3, -1, 2, 3][jumpFrame]);
+      const jumpFrame = Math.min(5, Math.floor(progress * 6));
+      setImagePose(["jumpUp", "jumpMidUp", "jumpUp", "jumpDown", "jumpMidDown", "jumpDown"][jumpFrame], direction, 0, [-3, -1.8, -0.5, 1.3, 2.3, 3][jumpFrame], jumpFrame);
     } else {
-      const walkFrame = Math.floor(now / 190) % 4;
-      setImagePose(["walkA", "walkA", "walkB", "walkB"][walkFrame], direction, [0, -1.1, -0.4, -1.3][walkFrame], [-0.8, 0, 0.8, 0][walkFrame]);
+      const walkFrame = Math.floor(now / 175) % 6;
+      setImagePose(["walkA", "walkC", "walkB", "walkD", "walkA", "walkD"][walkFrame], direction, [0, -1, -0.4, -1.35, -0.7, -1.1][walkFrame], [-0.8, -0.2, 0.7, 0.2, -0.4, 0.4][walkFrame], walkFrame);
     }
     if (progress >= 1) {
       x = anchorMove.to.x;
@@ -3103,13 +3232,15 @@ function renderDeskPetPlatform(root, plugin) {
     debugLayer.empty();
     if (isDraggingPet || speechIsOpen()) return false;
     if (now < scrollPausedUntil) {
-      setImagePose("read", direction, 0, 0);
+      const readFrame = Math.floor(now / 360) % 6;
+      setImagePose(readFrameSprite(readFrame), direction, 0, 0, readFrame);
       applyPetTransform();
       return true;
     }
     const target = updateAnchorTarget(surface);
     if (!target) {
-      setImagePose("read", direction, Math.sin(now / 420) * -0.8, 0);
+      const readFrame = Math.floor(now / 360) % 6;
+      setImagePose(readFrameSprite(readFrame), direction, Math.sin(now / 420) * -0.8, 0, readFrame);
       applyPetTransform();
       return true;
     }
@@ -3118,7 +3249,8 @@ function renderDeskPetPlatform(root, plugin) {
       startAnchorMove(target, now);
       return true;
     }
-    setImagePose("read", direction, Math.sin(now / 420) * -0.8, 0);
+    const readFrame = Math.floor(now / 360) % 6;
+    setImagePose(readFrameSprite(readFrame), direction, Math.sin(now / 420) * -0.8, 0, readFrame);
     applyPetTransform();
     return true;
   };
@@ -3146,7 +3278,8 @@ function renderDeskPetPlatform(root, plugin) {
     const bounds = rootBounds();
     x = clamp(point.x - dragOffset.x, 8, Math.max(8, bounds.width - petSize - 8));
     y = clamp(point.y - dragOffset.y, 24, Math.max(24, bounds.height - petSize - 8));
-    setImagePose("held", direction, Math.sin(performance.now() / 180) * 1.5, Math.sin(performance.now() / 230) * 2.5);
+    const heldFrame = Math.floor(performance.now() / 170) % 6;
+    setImagePose(["heldA", "heldA", "heldB", "heldB", "heldA", "heldB"][heldFrame], direction, [0.8, 1.4, 1.8, 1.2, 0.4, 0][heldFrame], [-2.5, -1.2, 0.8, 2.5, 1.1, -0.8][heldFrame], heldFrame);
     applyPetTransform();
   };
   const startPetDrag = () => {
@@ -3156,7 +3289,7 @@ function renderDeskPetPlatform(root, plugin) {
     action = "drag";
     dragOffset = { x: dragStartPoint.x - x, y: dragStartPoint.y - y };
     pet.addClass("is-dragging");
-    setImagePose("held", direction);
+    setImagePose("heldA", direction);
   };
   const finishPetDrag = (event) => {
     if (event.pointerId !== dragPointerId) return;
@@ -3234,15 +3367,18 @@ function renderDeskPetPlatform(root, plugin) {
     if (getMarkdownAnchorSurface()) anchorDirty = true;
   };
   const tick = (now = performance.now()) => {
+    syncPetLayer();
     if (isDraggingPet) {
-      setImagePose("held", direction, Math.sin(now / 180) * 1.5, Math.sin(now / 230) * 2.5);
+      const heldFrame = Math.floor(now / 170) % 6;
+      setImagePose(["heldA", "heldA", "heldB", "heldB", "heldA", "heldB"][heldFrame], direction, [0.8, 1.4, 1.8, 1.2, 0.4, 0][heldFrame], [-2.5, -1.2, 0.8, 2.5, 1.1, -0.8][heldFrame], heldFrame);
       frame = requestAnimationFrame(tick);
       return;
     }
     if (speechIsOpen()) {
       activeMove = null;
       anchorMove = null;
-      setImagePose("read", direction, 0, 0);
+      const readFrame = Math.floor(now / 360) % 6;
+      setImagePose(readFrameSprite(readFrame), direction, 0, 0, readFrame);
       applyPetTransform();
       frame = requestAnimationFrame(tick);
       return;
@@ -3289,10 +3425,17 @@ function renderDeskPetPlatform(root, plugin) {
         return;
       }
       if (action !== "idle" || now >= idleUntil) startIdle(now);
-      const idleFrame = Math.floor(now / 420) % 4;
-      const idleLift = idleAction === "sleep" ? [0, -0.4, -0.8, -0.4][idleFrame] : [0, -0.8, -1.4, -0.6][idleFrame];
-      const idleRotate = idleAction === "game" ? [-1, 0, 1, 0][idleFrame] : 0;
-      setImagePose(idleAction, 1, idleLift, idleRotate);
+      const idleFrame = Math.floor(now / 360) % 6;
+      const idleLift = idleAction === "sleep"
+        ? [0, -0.25, -0.55, -0.8, -0.55, -0.25][idleFrame]
+        : [0, -0.6, -1.1, -1.4, -0.9, -0.35][idleFrame];
+      const idleRotate = idleAction === "game" ? [-1, -0.4, 0.5, 1, 0.35, -0.45][idleFrame] : 0;
+      const idleSprite = idleAction === "read"
+        ? readFrameSprite(idleFrame)
+        : idleAction === "game"
+          ? ["game", "gameA", "gameA", "gameB", "gameB", "game"][idleFrame]
+          : ["sleep", "sleepA", "sleepA", "sleepB", "sleepB", "sleep"][idleFrame];
+      setImagePose(idleSprite, 1, idleLift, idleRotate, idleFrame);
       applyPetTransform();
       frame = requestAnimationFrame(tick);
       return;
@@ -4168,10 +4311,283 @@ function renderOverview(container, plugin, view) {
   renderCalendarPanel(calendarLayout.createDiv({ cls: "sr-panel sr-calendar-panel" }), plugin, view);
 }
 
+function citeTagValues(cache) {
+  const values = [];
+  for (const tag of cache?.tags || []) values.push(tag?.tag);
+  const frontmatterTags = cache?.frontmatter?.tags ?? cache?.frontmatter?.tag;
+  if (Array.isArray(frontmatterTags)) values.push(...frontmatterTags);
+  else if (typeof frontmatterTags === "string") values.push(...frontmatterTags.split(/[\s,]+/));
+  return values
+    .map((value) => String(value || "").trim().replace(/^#/, "").toLowerCase())
+    .filter(Boolean);
+}
+
+function listCiteMemoryCards(plugin, reviewDate = todayYmd()) {
+  const cards = plugin.app.vault.getMarkdownFiles()
+    .filter((file) => !normalizePath(file.path).startsWith(".trash/"))
+    .filter((file) => citeTagValues(plugin.app.metadataCache.getFileCache(file)).some((tag) => tag === "aed" || tag.startsWith("aed/")))
+    .map((file) => {
+      const cache = plugin.app.metadataCache.getFileCache(file);
+      const title = String(cache?.frontmatter?.title || file.basename || file.name).trim();
+      const review = plugin.repository.getCiteReview(file.path);
+      return {
+        file,
+        path: file.path,
+        title,
+        review,
+        due: !review || !review.nextReview || review.nextReview <= reviewDate,
+      };
+    });
+  cards.sort((left, right) => {
+    if (left.due !== right.due) return left.due ? -1 : 1;
+    if (!left.review !== !right.review) return !left.review ? -1 : 1;
+    const leftDate = left.review?.nextReview || reviewDate;
+    const rightDate = right.review?.nextReview || reviewDate;
+    const byDate = leftDate.localeCompare(rightDate);
+    return byDate !== 0 ? byDate : left.title.localeCompare(right.title, "en-US");
+  });
+  return cards;
+}
+
+function listOrganizeNotes(plugin) {
+  return plugin.app.vault.getMarkdownFiles()
+    .filter((file) => !normalizePath(file.path).startsWith(".trash/"))
+    .filter((file) => citeTagValues(plugin.app.metadataCache.getFileCache(file)).some((tag) => tag === "aing" || tag.startsWith("aing/")))
+    .map((file) => {
+      const cache = plugin.app.metadataCache.getFileCache(file);
+      return {
+        file,
+        path: file.path,
+        title: String(cache?.frontmatter?.title || file.basename || file.name).trim(),
+      };
+    })
+    .sort((left, right) => left.title.localeCompare(right.title, "en-US"));
+}
+
+function citeMemoryCatalogSignature(plugin) {
+  const recite = listCiteMemoryCards(plugin).map((card) => `aed\u0000${card.path}\u0000${card.title}`);
+  const organize = listOrganizeNotes(plugin).map((note) => `aing\u0000${note.path}\u0000${note.title}`);
+  return [...recite, ...organize].sort().join("\u0001");
+}
+
+async function openCiteMemoryCard(plugin, card) {
+  const file = plugin.app.vault.getAbstractFileByPath(card.path);
+  if (!file || typeof file.path !== "string") throw new Error("Card note was not found.");
+  await plugin.app.workspace.getLeaf("tab").openFile(file);
+}
+
+function attachCiteCardPointerDrag(cardEl, card, zones, plugin) {
+  cardEl.draggable = false;
+  let pointerId = null;
+  let start = null;
+  let offset = null;
+  let dragging = false;
+  let ghost = null;
+  let activeZone = null;
+  let suppressClick = false;
+
+  const clearZone = () => {
+    for (const zone of zones) zone.element.removeClass("is-active");
+    activeZone = null;
+  };
+  const cleanup = () => {
+    clearZone();
+    ghost?.remove();
+    ghost = null;
+    cardEl.removeClass("is-dragging");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onCancel);
+    pointerId = null;
+    start = null;
+    offset = null;
+    dragging = false;
+  };
+  const zoneNearPoint = (x, y) => zones.find((zone) => {
+    const rect = zone.element.getBoundingClientRect();
+    const magnet = 24;
+    return x >= rect.left - magnet && x <= rect.right + magnet && y >= rect.top - magnet && y <= rect.bottom + magnet;
+  }) || null;
+  const ensureGhost = () => {
+    if (ghost) return ghost;
+    const rect = cardEl.getBoundingClientRect();
+    ghost = document.body.createDiv({ cls: "sr-memory-card-ghost" });
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    ghost.createEl("strong", { text: card.title });
+    ghost.createSpan({ text: "AED" });
+    return ghost;
+  };
+  const positionGhost = (event) => {
+    const preview = ensureGhost();
+    const zone = zoneNearPoint(event.clientX, event.clientY);
+    clearZone();
+    activeZone = zone;
+    if (zone) zone.element.addClass("is-active");
+    let left = event.clientX - offset.x;
+    let top = event.clientY - offset.y;
+    if (zone) {
+      const zoneRect = zone.element.getBoundingClientRect();
+      const ghostRect = preview.getBoundingClientRect();
+      const snappedLeft = zoneRect.left + (zoneRect.width - ghostRect.width) / 2;
+      const snappedTop = zoneRect.top + (zoneRect.height - ghostRect.height) / 2;
+      left += (snappedLeft - left) * 0.55;
+      top += (snappedTop - top) * 0.55;
+      preview.addClass("is-magnetic");
+    } else {
+      preview.removeClass("is-magnetic");
+    }
+    preview.style.transform = `translate3d(${left}px, ${top}px, 0)`;
+    preview.addClass("is-visible");
+  };
+  const onMove = (event) => {
+    if (event.pointerId !== pointerId || !start) return;
+    if (!dragging && Math.hypot(event.clientX - start.x, event.clientY - start.y) < 5) return;
+    if (!dragging) {
+      dragging = true;
+      suppressClick = true;
+      cardEl.addClass("is-dragging");
+      cardEl.setPointerCapture?.(pointerId);
+    }
+    event.preventDefault();
+    positionGhost(event);
+  };
+  const commit = async (zone) => {
+    const zoneRect = zone.element.getBoundingClientRect();
+    const ghostRect = ghost?.getBoundingClientRect();
+    if (ghost && ghostRect) {
+      ghost.addClass("is-committing");
+      ghost.style.transform = `translate3d(${zoneRect.left + (zoneRect.width - ghostRect.width) / 2}px, ${zoneRect.top + (zoneRect.height - ghostRect.height) / 2}px, 0) scale(.84)`;
+    }
+    cardEl.addClass("is-committing");
+    await new Promise((resolve) => window.setTimeout(resolve, 170));
+    cleanup();
+    try {
+      await plugin.repository.reviewCiteCardAndPersist(card.path, zone.rating, todayYmd());
+      new Notice(`${card.title}: ${zone.label}`);
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : "Failed to update card review.");
+    }
+  };
+  const onUp = (event) => {
+    if (event.pointerId !== pointerId) return;
+    const zone = dragging ? activeZone : null;
+    if (zone) {
+      void commit(zone);
+      return;
+    }
+    cleanup();
+  };
+  const onCancel = (event) => {
+    if (event.pointerId === pointerId) cleanup();
+  };
+
+  cardEl.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || pointerId != null) return;
+    const rect = cardEl.getBoundingClientRect();
+    pointerId = event.pointerId;
+    start = { x: event.clientX, y: event.clientY };
+    offset = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    window.addEventListener("pointermove", onMove, { passive: false });
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+  });
+  cardEl.addEventListener("click", (event) => {
+    if (suppressClick) {
+      suppressClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    void openCiteMemoryCard(plugin, card).catch((error) => new Notice(error instanceof Error ? error.message : "Failed to open card."));
+  });
+  cardEl.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    void openCiteMemoryCard(plugin, card).catch((error) => new Notice(error instanceof Error ? error.message : "Failed to open card."));
+  });
+}
+
+function renderCiteMemoryPanel(container, plugin) {
+  const cards = listCiteMemoryCards(plugin);
+  const dueCards = cards.filter((card) => card.due);
+  const organizeNotes = listOrganizeNotes(plugin);
+  const tomorrow = shiftDateDays(todayYmd(), 1);
+  const tomorrowCount = cards.filter((card) => card.review?.nextReview === tomorrow).length;
+  const nextCard = cards.filter((card) => !card.due && card.review?.nextReview).sort((left, right) => left.review.nextReview.localeCompare(right.review.nextReview))[0];
+  const head = container.createDiv({ cls: "sr-memory-head" });
+  head.createEl("h3", { text: dueCards.length > 0 ? "Aed Review" : organizeNotes.length > 0 ? "Aing Notes" : "Daily Cards" });
+  head.createSpan({ text: `${dueCards.length} Aed · ${organizeNotes.length} Aing · ${tomorrowCount} tomorrow` });
+
+  const body = container.createDiv({ cls: "sr-memory-body" });
+  const queue = body.createDiv({ cls: "sr-memory-queue" });
+  if (dueCards.length === 0 && organizeNotes.length === 0) {
+    body.addClass("is-empty");
+    const empty = queue.createDiv({ cls: "sr-memory-empty" });
+    setIcon(empty.createSpan(), "check-circle-2");
+    empty.createEl("strong", { text: cards.length === 0 ? "No #Aed cards found" : "All caught up" });
+    empty.createSpan({ text: nextCard ? `Next review · ${fullDateLabel(nextCard.review.nextReview)}` : "Use #Aed for review and #Aing for notes." });
+  }
+
+  if (dueCards.length > 0) {
+    queue.addClass("is-hand");
+    const slots = body.createDiv({ cls: "sr-memory-slots" });
+    const zoneDefinitions = [
+      { rating: "remembered", label: "Remembered", icon: "check", color: "green" },
+      { rating: "fuzzy", label: "Fuzzy", icon: "circle-help", color: "yellow" },
+      { rating: "forgotten", label: "Forgotten", icon: "rotate-ccw", color: "blue" },
+    ];
+    const zones = zoneDefinitions.map((definition) => {
+      const element = slots.createDiv({ cls: `sr-memory-slot is-${definition.color}` });
+      setIcon(element.createSpan({ cls: "sr-memory-slot-icon" }), definition.icon);
+      element.createEl("strong", { text: definition.label });
+      element.createSpan({ text: "Drop card" });
+      return { ...definition, element };
+    });
+
+    const handCenter = (dueCards.length - 1) / 2;
+    for (const [index, card] of dueCards.entries()) {
+      const item = queue.createDiv({ cls: "sr-memory-card", attr: { tabindex: "0", role: "link", "aria-label": `Open ${card.title}` } });
+      item.style.setProperty("--memory-card-rotate", `${Math.max(-7, Math.min(7, (index - handCenter) * 1.7))}deg`);
+      item.style.setProperty("--memory-card-lift", `${Math.min(7, Math.abs(index - handCenter) * 1.25)}px`);
+      item.style.zIndex = String(index + 1);
+      const icon = item.createSpan({ cls: "sr-memory-card-icon" });
+      setIcon(icon, "notebook-tabs");
+      const copy = item.createDiv({ cls: "sr-memory-card-copy" });
+      copy.createEl("strong", { text: card.title });
+      copy.createSpan({ text: card.path });
+      item.createSpan({ cls: "sr-memory-card-state", text: card.review ? `Due · ${card.review.reviewCount} reviews` : "New" });
+      attachCiteCardPointerDrag(item, card, zones, plugin);
+    }
+  } else if (organizeNotes.length > 0) {
+    body.addClass("is-organize");
+    queue.addClass("is-hand");
+    const handCenter = (organizeNotes.length - 1) / 2;
+    for (const [index, note] of organizeNotes.entries()) {
+      const item = queue.createDiv({ cls: "sr-memory-card is-organize", attr: { tabindex: "0", role: "link", "aria-label": `Open ${note.title}` } });
+      item.style.setProperty("--memory-card-rotate", `${Math.max(-7, Math.min(7, (index - handCenter) * 1.7))}deg`);
+      item.style.setProperty("--memory-card-lift", `${Math.min(7, Math.abs(index - handCenter) * 1.25)}px`);
+      item.style.zIndex = String(index + 1);
+      const icon = item.createSpan({ cls: "sr-memory-card-icon" });
+      setIcon(icon, "inbox");
+      const copy = item.createDiv({ cls: "sr-memory-card-copy" });
+      copy.createEl("strong", { text: note.title });
+      copy.createSpan({ text: note.path });
+      item.createSpan({ cls: "sr-memory-card-state", text: "Pending" });
+      const open = () => void openCiteMemoryCard(plugin, note).catch((error) => new Notice(error instanceof Error ? error.message : "Failed to open note."));
+      item.addEventListener("click", open);
+      item.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        open();
+      });
+    }
+  }
+}
+
 function renderLifeRpgOverview(container, plugin, selectedDate) {
   const repository = plugin.repository;
   const overview = buildOverviewStats(repository, selectedDate);
-  const status = dailyStatusEntryForDate(repository, selectedDate);
   container.createEl("h2", { text: "Overview" });
 
   const grid = container.createDiv({ cls: "sr-overview-dashboard" });
@@ -4240,25 +4656,8 @@ function renderLifeRpgOverview(container, plugin, selectedDate) {
     void sendOverviewNoteToAi();
   });
 
-  const statusPanel = grid.createDiv({ cls: "sr-overview-card sr-overview-status-panel" });
-  statusPanel.createEl("h3", { text: "Today Status" });
-  const metrics = [
-    scoreStatusMetric("Mood", dailyStatusValue(status, "daily-mood")),
-    scoreStatusMetric("Sleep Rate", dailyStatusValue(status, "daily-sleep")),
-    sleepTimeStatusMetric(dailyStatusValue(status, "daily-sleep-time")),
-  ];
-  for (const metric of metrics) {
-    const row = statusPanel.createDiv({ cls: "sr-overview-status-row" });
-    const head = row.createDiv({ cls: "sr-overview-status-head" });
-    head.createSpan({ text: metric.label });
-    head.createEl("strong", { text: metric.value });
-    const track = row.createDiv({ cls: "sr-overview-status-track" });
-    const fill = track.createDiv({ cls: "sr-overview-status-fill" });
-    fill.style.width = `${Math.max(0, Math.min(100, metric.percent))}%`;
-  }
-  if (!status) {
-    statusPanel.createDiv({ cls: "sr-muted", text: "No Daily Status recorded for this date." });
-  }
+  const memoryPanel = grid.createDiv({ cls: "sr-overview-card sr-memory-panel" });
+  renderCiteMemoryPanel(memoryPanel, plugin);
 }
 
 function buildPixelAvatarSvg(classLabel) {
@@ -6738,6 +7137,26 @@ module.exports = class StructuredReviewPlugin extends Plugin {
     this.settings = normalizeSettings(source.settings);
     this.repository = new Repository(this, { ...source, settings: this.settings });
     this.reportService = new ReportService(this, this.repository);
+    this.citeMemorySignature = citeMemoryCatalogSignature(this);
+    this.citeMemoryDate = todayYmd();
+    let citeRefreshTimer = 0;
+    const scheduleCiteRefresh = () => {
+      if (citeRefreshTimer) window.clearTimeout(citeRefreshTimer);
+      citeRefreshTimer = window.setTimeout(() => {
+        citeRefreshTimer = 0;
+        const signature = citeMemoryCatalogSignature(this);
+        if (signature === this.citeMemorySignature) return;
+        this.citeMemorySignature = signature;
+        for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) leaf.view?.render?.();
+      }, 450);
+    };
+    this.registerEvent(this.app.metadataCache.on("changed", scheduleCiteRefresh));
+    this.registerEvent(this.app.vault.on("create", scheduleCiteRefresh));
+    this.registerEvent(this.app.vault.on("delete", scheduleCiteRefresh));
+    this.registerEvent(this.app.vault.on("rename", scheduleCiteRefresh));
+    this.register(() => {
+      if (citeRefreshTimer) window.clearTimeout(citeRefreshTimer);
+    });
 
     this.registerView(VIEW_TYPE, (leaf) => new StructuredReviewView(leaf, this));
     this.addSettingTab(new StructuredReviewSettingTab(this.app, this));
@@ -6811,6 +7230,11 @@ module.exports = class StructuredReviewPlugin extends Plugin {
     });
     this.registerInterval(window.setInterval(() => {
       void this.maybePromptScheduledReports();
+      const currentDate = todayYmd();
+      if (currentDate !== this.citeMemoryDate) {
+        this.citeMemoryDate = currentDate;
+        for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) leaf.view?.render?.();
+      }
     }, 60 * 60 * 1000));
   }
 
