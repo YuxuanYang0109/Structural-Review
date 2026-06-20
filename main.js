@@ -19,6 +19,10 @@ const {
 const VIEW_TYPE = "structured-review-view";
 const TEMPORARY_ARCHIVE_ID = "__temporary_archive__";
 const REPORT_ROOT = "StructuredReview/reports";
+const CITE_REVIEWS_FILE_NAME = "cite-reviews.json";
+const SYNC_ROOT = "StructuredReview/sync";
+const SYNC_DATA_FILE = `${SYNC_ROOT}/data.json`;
+const SYNC_CITE_REVIEWS_FILE = `${SYNC_ROOT}/cite-reviews.json`;
 const DEFAULT_DATA = { version: 3, projects: [], entries: [], timelineModules: [], citeReviews: [], settings: {} };
 const DEFAULT_SETTINGS = {
   deepseekApiKey: "",
@@ -26,10 +30,11 @@ const DEFAULT_SETTINGS = {
   reportMemoryCount: 4,
   petSystemPrompt: "你是一个小小的桌宠伙伴。请用中文回答，语气温柔、机灵、简短，像贴心但不啰嗦的朋友。回答控制在 1-3 句话，适合显示在桌宠头上的小气泡里。",
   deskPetMode: "follow",
+  tabletMode: "auto",
   lastWeeklyPromptDate: "",
   lastMonthlyPromptDate: "",
 };
-const FIELD_TYPES = ["number", "score", "text", "date", "file"];
+const FIELD_TYPES = ["number", "score", "emotion", "text", "date", "file"];
 const PROJECT_TYPES = ["long-term", "short-term", "temporary", "daily-status"];
 const PROJECT_PALETTE = [
   { value: "#BF616A", label: "Rose" },
@@ -59,7 +64,7 @@ const RPG_ATTRIBUTE_HINTS = {
   Creation: ["write one paragraph", "ship a small improvement", "sketch an idea", "code one tiny feature", "make something visible"],
 };
 const DAILY_STATUS_FIELDS = [
-  { id: "daily-mood", name: "Mood 心情", type: "score", required: true, options: [], sortOrder: 0 },
+  { id: "daily-mood", name: "Mood 心情", type: "emotion", required: true, options: [], sortOrder: 0 },
   { id: "daily-sleep", name: "Sleep 睡眠评级", type: "score", required: true, options: [], sortOrder: 1 },
   { id: "daily-sleep-time", name: "Sleep Time 睡眠时间", type: "time-range", required: false, options: [], sortOrder: 2 },
   { id: "daily-dream", name: "Dream Description 梦境描述", type: "text", required: false, options: [], sortOrder: 3 },
@@ -76,6 +81,7 @@ function normalizeSettings(settings) {
   const source = settings && typeof settings === "object" ? settings : {};
   const memoryCount = Number(source.reportMemoryCount);
   const mode = ["fixed", "follow", "free"].includes(source.deskPetMode) ? source.deskPetMode : DEFAULT_SETTINGS.deskPetMode;
+  const tabletMode = ["auto", "on", "off"].includes(source.tabletMode) ? source.tabletMode : DEFAULT_SETTINGS.tabletMode;
   return {
     ...DEFAULT_SETTINGS,
     ...source,
@@ -84,9 +90,31 @@ function normalizeSettings(settings) {
     reportMemoryCount: Number.isFinite(memoryCount) ? Math.max(0, Math.min(8, Math.round(memoryCount))) : DEFAULT_SETTINGS.reportMemoryCount,
     petSystemPrompt: String(source.petSystemPrompt || DEFAULT_SETTINGS.petSystemPrompt).trim() || DEFAULT_SETTINGS.petSystemPrompt,
     deskPetMode: mode,
+    tabletMode,
     lastWeeklyPromptDate: String(source.lastWeeklyPromptDate || ""),
     lastMonthlyPromptDate: String(source.lastMonthlyPromptDate || ""),
   };
+}
+
+function isProbablyTouchDevice() {
+  if (typeof window === "undefined") return false;
+  return Boolean(window.matchMedia?.("(pointer: coarse)")?.matches || window.navigator?.maxTouchPoints > 0);
+}
+
+function isTabletModeEnabled(settings) {
+  const mode = normalizeSettings(settings).tabletMode;
+  if (mode === "on") return true;
+  if (mode === "off") return false;
+  return isProbablyTouchDevice();
+}
+
+function isTabletMode(plugin) {
+  return isTabletModeEnabled(plugin?.settings);
+}
+
+function applyTabletModeClass(plugin) {
+  if (typeof document === "undefined") return;
+  document.body.classList.toggle("sr-tablet-mode", isTabletMode(plugin));
 }
 
 function nowIso() {
@@ -536,6 +564,19 @@ function rgba(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+function mixRgb(left, right, ratio) {
+  const t = Math.max(0, Math.min(1, ratio));
+  return {
+    r: Math.round(left.r + (right.r - left.r) * t),
+    g: Math.round(left.g + (right.g - left.g) * t),
+    b: Math.round(left.b + (right.b - left.b) * t),
+  };
+}
+
+function rgbCss(color) {
+  return `rgb(${color.r}, ${color.g}, ${color.b})`;
+}
+
 function gradientForWeights(items) {
   if (!items || items.length === 0) return "linear-gradient(135deg, rgba(120,120,120,0.12), rgba(120,120,120,0.05))";
   if (items.length === 1) return items[0].color;
@@ -578,6 +619,95 @@ function normalizeScoreValue(value, fieldName) {
   if (score < 0 || score > 5) throw new Error(`Score must be between 0 and 5: ${fieldName}`);
   return Math.round(score * 10) / 10;
 }
+
+function normalizeEmotionValue(value, fieldName) {
+  if (value == null || value === "") return "";
+  if (typeof value === "number" || typeof value === "string") {
+    const pleasure = normalizeScoreValue(value, fieldName);
+    return pleasure === "" ? "" : { pleasure, energy: 3 };
+  }
+  const pleasure = normalizeScoreValue(value.pleasure, `${fieldName} pleasure`);
+  const energy = normalizeScoreValue(value.energy, `${fieldName} energy`);
+  if (pleasure === "" && energy === "") return "";
+  return {
+    pleasure: pleasure === "" ? 3 : pleasure,
+    energy: energy === "" ? 3 : energy,
+  };
+}
+
+function emotionValueParts(value) {
+  if (value == null || value === "") return null;
+  try {
+    const normalized = normalizeEmotionValue(value, "Emotion");
+    return normalized && typeof normalized === "object" ? normalized : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function emotionStatusLabel(value) {
+  const emotion = emotionValueParts(value);
+  if (!emotion) return "-";
+  return `Pleasure ${formatRpgXp(emotion.pleasure)}/5 · Energy ${formatRpgXp(emotion.energy)}/5`;
+}
+
+function emotionColor(value) {
+  const emotion = emotionValueParts(value);
+  if (!emotion) return "";
+  const pleasureRatio = emotion.pleasure / 5;
+  const energyRatio = emotion.energy / 5;
+  const topLeft = hexToRgb("#BF616A");
+  const topRight = hexToRgb("#EBCB8B");
+  const bottomRight = hexToRgb("#A3BE8C");
+  const bottomLeft = hexToRgb("#81A1C1");
+  const top = mixRgb(topLeft, topRight, pleasureRatio);
+  const bottom = mixRgb(bottomLeft, bottomRight, pleasureRatio);
+  return rgbCss(mixRgb(bottom, top, energyRatio));
+}
+
+function emotionBackground(value) {
+  const color = emotionColor(value);
+  return color ? `color-mix(in srgb, ${color} 14%, transparent)` : "";
+}
+
+function emotionCalendarColor(value) {
+  const emotion = emotionValueParts(value);
+  if (!emotion) return "";
+  const pleasureRatio = emotion.pleasure / 5;
+  const energyRatio = emotion.energy / 5;
+  const corners = [
+    { x: 0, y: 1, color: "#BF616A" },
+    { x: 1, y: 1, color: "#EBCB8B" },
+    { x: 1, y: 0, color: "#A3BE8C" },
+    { x: 0, y: 0, color: "#81A1C1" },
+  ];
+  const nearest = corners
+    .map((corner) => ({
+      ...corner,
+      distance: Math.hypot(pleasureRatio - corner.x, energyRatio - corner.y),
+    }))
+    .sort((left, right) => left.distance - right.distance)[0];
+  return nearest?.color || "";
+}
+
+function calendarMarkJitter(seed) {
+  let hash = 0;
+  const value = String(seed || "");
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
+  }
+  const part = (shift, modulo) => Math.abs((hash >> shift) % modulo);
+  return {
+    x: part(0, 7) - 3,
+    y: part(4, 5) - 2,
+    rotate: part(8, 17) - 8,
+    scale: 0.92 + part(12, 17) / 100,
+    width: 23 + part(16, 7),
+    height: 18 + part(20, 7),
+    radius: `${44 + part(2, 16)}% ${42 + part(6, 18)}% ${48 + part(10, 18)}% ${40 + part(14, 18)}%`,
+  };
+}
+
 function normalizeField(field, index) {
   const type = FIELD_TYPES.includes(field?.type) ? field.type : "text";
   const name = String(field?.name || "").trim() || defaultFieldName(type, index);
@@ -664,6 +794,23 @@ function normalizeCiteReview(review) {
   };
 }
 
+function normalizeCiteReviews(reviews) {
+  return Array.isArray(reviews)
+    ? reviews.map(normalizeCiteReview).filter((review) => review.path)
+    : [];
+}
+
+function mainDataPayload(data, settings) {
+  const source = data && typeof data === "object" ? data : DEFAULT_DATA;
+  return {
+    version: source.version || DEFAULT_DATA.version,
+    projects: Array.isArray(source.projects) ? source.projects : [],
+    entries: Array.isArray(source.entries) ? source.entries : [],
+    timelineModules: Array.isArray(source.timelineModules) ? source.timelineModules : [],
+    settings: normalizeSettings(settings || source.settings),
+  };
+}
+
 function validateTimelineModuleInput(input) {
   const name = String(input?.name || "").trim();
   const projectId = String(input?.projectId || "").trim();
@@ -686,7 +833,7 @@ class Repository {
       projects: Array.isArray(source.projects) ? source.projects.map(normalizeProject) : [],
       entries: Array.isArray(source.entries) ? source.entries.map(normalizeEntry) : [],
       timelineModules: Array.isArray(source.timelineModules) ? source.timelineModules.map(normalizeTimelineModule) : [],
-      citeReviews: Array.isArray(source.citeReviews) ? source.citeReviews.map(normalizeCiteReview).filter((review) => review.path) : [],
+      citeReviews: normalizeCiteReviews(source.citeReviews),
       settings: normalizeSettings(source.settings),
     };
   }
@@ -952,6 +1099,7 @@ class Repository {
         if (missing) throw new Error(`Field required: ${field.name}`);
       }
       if (field.type === "score") rawValue = normalizeScoreValue(rawValue, field.name);
+      if (field.type === "emotion") rawValue = normalizeEmotionValue(rawValue, field.name);
       nextValues[field.id] = rawValue;
     }
     const timestamp = nowIso();
@@ -996,6 +1144,7 @@ class Repository {
         if (missing) throw new Error(`Field required: ${field.name}`);
       }
       if (field.type === "score") rawValue = normalizeScoreValue(rawValue, field.name);
+      if (field.type === "emotion") rawValue = normalizeEmotionValue(rawValue, field.name);
       nextValues[field.id] = rawValue;
     }
     entry.date = startAt.slice(0, 10);
@@ -1332,6 +1481,24 @@ function renderFieldValue(parent, field, value, app) {
     }
     return;
   }
+  if (field.type === "emotion") {
+    const emotion = emotionValueParts(value);
+    const row = parent.createDiv({ cls: "sr-emotion-meter" });
+    const head = row.createDiv({ cls: "sr-score-meter-head" });
+    head.createSpan({ text: field.name });
+    head.createSpan({ text: emotionStatusLabel(value) });
+    const plane = row.createDiv({ cls: "sr-emotion-plane" });
+    const dot = plane.createSpan({ cls: "sr-emotion-dot" });
+    if (emotion) {
+      dot.style.left = `${(emotion.pleasure / 5) * 100}%`;
+      dot.style.top = `${100 - (emotion.energy / 5) * 100}%`;
+      dot.style.background = emotionColor(value);
+    } else {
+      dot.style.display = "none";
+    }
+    row.createDiv({ cls: "sr-emotion-axis-labels", text: "Calm ← Pleasure → Bright · Low ← Energy → High" });
+    return;
+  }
   if (field.type === "time-range") {
     const range = parseTimeRangeValue(value, 23 * 60, 31 * 60, { allowWrap: true });
     const row = parent.createDiv({ cls: "sr-tag" });
@@ -1417,6 +1584,15 @@ function getEntryNumberValue(project, entry, matchers) {
   return Number.isFinite(value) ? value : null;
 }
 
+function getEntryEmotionValue(project, entry, matchers) {
+  const field = project.fields.find((item) => {
+    const name = String(item.name || "").toLowerCase();
+    return item.type === "emotion" && matchers.some((matcher) => name.includes(matcher));
+  });
+  if (!field) return null;
+  return emotionValueParts(entry.values[field.id]);
+}
+
 function getEntryTimeRangeMinutes(project, entry, matchers) {
   const field = project.fields.find((item) => {
     const name = String(item.name || "").toLowerCase();
@@ -1484,11 +1660,13 @@ function rpgDailyStatusEntries(repository) {
 
 function rpgApplyDailyStatus(xp, repository, statusEntry) {
   const { entry, project } = statusEntry;
-  const mood = getEntryNumberValue(project, entry, ["mood"]);
+  const moodEmotion = getEntryEmotionValue(project, entry, ["mood"]);
+  const mood = moodEmotion ? moodEmotion.pleasure : getEntryNumberValue(project, entry, ["mood"]);
   const sleep = getEntryNumberValue(project, entry, ["sleep"]);
   const moodDelta = statusScoreDelta(mood);
   const sleepDelta = statusScoreDelta(sleep);
   if (moodDelta != null) addRpgXp(xp, "Mind", moodDelta);
+  if (moodEmotion) addRpgXp(xp, "Focus", Math.round((moodEmotion.energy - 3) * 5) / 10);
   if (sleepDelta != null) {
     addRpgXp(xp, "Mind", sleepDelta);
     addRpgXp(xp, "Body", sleepDelta);
@@ -1552,12 +1730,18 @@ function scoreStatusMetric(label, value) {
   };
 }
 
+function sleepTimeMinutes(value) {
+  if (!value) return null;
+  const range = parseTimeRangeValue(value, 23 * 60, 31 * 60, { allowWrap: true });
+  return Math.max(0, range.end - range.start);
+}
+
 function sleepTimeStatusMetric(value) {
   if (!value) {
     return { label: "Sleep Time", value: "-", percent: 0 };
   }
   const range = parseTimeRangeValue(value, 23 * 60, 31 * 60, { allowWrap: true });
-  const minutes = Math.max(0, range.end - range.start);
+  const minutes = sleepTimeMinutes(value) || 0;
   return {
     label: "Sleep Time",
     value: `${timeRangeValue(range.start, range.end)} · ${durationLabelFromMinutes(minutes)}`,
@@ -1665,7 +1849,7 @@ function buildDeskPetAiMessages(plugin, selectedDate, noteContent) {
   const overview = buildOverviewStats(repository, selectedDate);
   const status = dailyStatusEntryForDate(repository, selectedDate);
   const statusLines = [
-    `User mood rating: ${dailyStatusValue(status, "daily-mood") || "-"}`,
+    `User mood coordinate: ${emotionStatusLabel(dailyStatusValue(status, "daily-mood"))}`,
     `User sleep rating: ${dailyStatusValue(status, "daily-sleep") || "-"}`,
     `User sleep time: ${dailyStatusValue(status, "daily-sleep-time") || "-"}`,
     `User dream record: ${dailyStatusValue(status, "daily-dream") || "-"} (This is the user's dream record, not the desk pet's dream.)`,
@@ -2330,7 +2514,7 @@ function renderDeskPetPlatform(root, plugin) {
     preload.src = source;
   }
   const pet = root.createDiv({ cls: isGlobalPet ? "sr-deskpet is-global" : "sr-deskpet" });
-  pet.setAttr("title", "Shift + double click: toggle platform debug");
+  pet.setAttr("title", isTabletMode(plugin) ? "Double click: mode menu. Shift + double click: debug" : "Right click: mode menu. Shift + double click: debug");
   const img = pet.createEl("img", { attr: { alt: "", src: sprites.jumpDown, draggable: "false" } });
   const speechBubble = pet.createDiv({ cls: "sr-deskpet-speech" });
   speechBubble.setAttr("tabindex", "-1");
@@ -3345,6 +3529,10 @@ function renderDeskPetPlatform(root, plugin) {
     updateDraggedPet(event);
   };
   const handleDebugToggle = (event) => {
+    if (!event.shiftKey && isTabletMode(plugin)) {
+      showModeMenu(event);
+      return;
+    }
     if (!event.shiftKey) return;
     debugEnabled = !debugEnabled;
     localStorage.setItem("srDeskPetDebug", debugEnabled ? "1" : "0");
@@ -4136,6 +4324,8 @@ function timelineItemDetailData(item) {
       if (value == null || value === "") continue;
       if (field.type === "score") {
         fields.push([field.name, `${formatRpgXp(Number(value))}/5`]);
+      } else if (field.type === "emotion") {
+        fields.push([field.name, emotionStatusLabel(value)]);
       } else if (field.type === "file") {
         fields.push([field.name, fileNameFromPath(value)]);
       } else if (field.type === "time-range") {
@@ -4205,6 +4395,10 @@ function renderCalendarPanel(container, plugin, view) {
   const repository = plugin.repository;
   const projects = repository.listProjects().filter((project, index) => project.isActive && !isDailyStatusProject(project) && projectDomainMeta(project, index).key !== "sleep");
   const laneMap = shortTermLaneMap(projects);
+  const statusByDate = new Map();
+  for (const item of rpgDailyStatusEntries(repository).sort((left, right) => left.entry.updatedAt.localeCompare(right.entry.updatedAt))) {
+    statusByDate.set(item.entry.date, item);
+  }
   const entryDatesByProject = new Map(
     projects.map((project) => [project.id, new Set(repository.listEntries(project.id).map((entry) => entry.date))])
   );
@@ -4235,6 +4429,42 @@ function renderCalendarPanel(container, plugin, view) {
     if (!cell.inCurrentMonth) day.addClass("is-outside-month");
     if (cell.date === todayYmd()) day.addClass("is-today");
     if (cell.date === view.selectedDate) day.addClass("is-selected");
+    let todayMark = null;
+    if (cell.date === todayYmd()) {
+      const todayJitter = calendarMarkJitter(`${cell.date}-today-ring`);
+      todayMark = todayJitter;
+      day.style.setProperty("--today-ring-x", `${todayJitter.x}px`);
+      day.style.setProperty("--today-ring-y", `${todayJitter.y}px`);
+      day.style.setProperty("--today-ring-rotate", `${todayJitter.rotate}deg`);
+      day.style.setProperty("--today-ring-scale", String(1.04 + (todayJitter.scale - 0.92)));
+      day.style.setProperty("--today-ring-width", `${todayJitter.width + 12}px`);
+      day.style.setProperty("--today-ring-height", `${todayJitter.height + 9}px`);
+      day.style.setProperty("--today-ring-radius", todayJitter.radius);
+    }
+    const status = statusByDate.get(cell.date);
+    const moodColor = emotionCalendarColor(dailyStatusValue(status, "daily-mood"));
+    if (moodColor) {
+      day.addClass("has-emotion");
+      day.style.setProperty("--calendar-mood-color", moodColor);
+      day.style.setProperty("--calendar-mood-bg", emotionBackground(dailyStatusValue(status, "daily-mood")));
+    }
+    const sleepMinutes = sleepTimeMinutes(dailyStatusValue(status, "daily-sleep-time"));
+    let sleepMark = null;
+    if (sleepMinutes != null && cell.date !== todayYmd()) {
+      const isSleepOk = sleepMinutes >= 420;
+      day.addClass("has-sleep-mark");
+      day.addClass(isSleepOk ? "is-sleep-ok" : "is-sleep-low");
+      const jitter = calendarMarkJitter(`${cell.date}-${isSleepOk ? "ok" : "low"}`);
+      sleepMark = { isSleepOk, jitter };
+      day.style.setProperty("--sleep-mark-x", `${jitter.x}px`);
+      day.style.setProperty("--sleep-mark-y", `${jitter.y}px`);
+      day.style.setProperty("--sleep-mark-rotate", `${jitter.rotate}deg`);
+      day.style.setProperty("--sleep-mark-scale", String(jitter.scale));
+      day.style.setProperty("--sleep-mark-width", `${jitter.width}px`);
+      day.style.setProperty("--sleep-mark-height", `${jitter.height}px`);
+      day.style.setProperty("--sleep-mark-radius", jitter.radius);
+      day.setAttr("title", `${fullDateLabel(cell.date)} | Sleep ${durationLabelFromMinutes(sleepMinutes)}`);
+    }
     day.addEventListener("click", () => {
       view.selectedDate = cell.date;
       view.currentMonthKey = monthKeyFromDate(cell.date);
@@ -4245,18 +4475,49 @@ function renderCalendarPanel(container, plugin, view) {
     const longTermProjects = projects.filter((project) => project.type === "long-term" && (entryDatesByProject.get(project.id)?.has(cell.date) || projectOverlapsDate(project, cell.date)));
     if (longTermProjects.length > 0) {
       const dotsWrap = day.createDiv({ cls: "sr-calendar-dots" });
-      for (const project of longTermProjects.slice(0, 4)) {
+      for (const project of longTermProjects) {
         const dot = dotsWrap.createSpan({ cls: "sr-calendar-dot" });
         dot.style.background = project.color;
         dot.setAttr("title", project.name + " | " + projectScheduleLabel(project));
-      }
-      if (longTermProjects.length > 4) {
-        dotsWrap.createSpan({ cls: "sr-calendar-dot-overflow", text: "+" + (longTermProjects.length - 4) });
       }
     }
 
     const number = day.createDiv({ cls: "sr-calendar-day-number", text: String(cell.day) });
     number.setAttr("aria-label", fullDateLabel(cell.date));
+    if (sleepMark?.isSleepOk) {
+      const ring = number.createSpan({ cls: "sr-calendar-sketch-ring sr-calendar-sleep-ring", attr: { "aria-hidden": "true" } });
+      for (let lineIndex = 0; lineIndex < 3; lineIndex += 1) {
+        const jitter = calendarMarkJitter(`${cell.date}-sleep-ring-${lineIndex}`);
+        const line = ring.createSpan();
+        line.style.setProperty("--ring-x", `${jitter.x + lineIndex - 1}px`);
+        line.style.setProperty("--ring-y", `${jitter.y + (lineIndex % 2 ? 1 : -1)}px`);
+        line.style.setProperty("--ring-rotate", `${jitter.rotate + (lineIndex - 1) * 7}deg`);
+        line.style.setProperty("--ring-scale", String(jitter.scale + lineIndex * 0.035));
+        line.style.setProperty("--ring-width", `${jitter.width + 7 + lineIndex * 2}px`);
+        line.style.setProperty("--ring-height", `${jitter.height + 7 + (lineIndex % 2) * 3}px`);
+        line.style.setProperty("--ring-radius", jitter.radius);
+      }
+    } else if (sleepMark && !sleepMark.isSleepOk) {
+      const mark = number.createSpan({ cls: "sr-calendar-sleep-x", text: "×", attr: { "aria-hidden": "true" } });
+      mark.style.setProperty("--ring-x", `${sleepMark.jitter.x}px`);
+      mark.style.setProperty("--ring-y", `${sleepMark.jitter.y}px`);
+      mark.style.setProperty("--ring-rotate", `${sleepMark.jitter.rotate}deg`);
+      mark.style.setProperty("--ring-scale", String(sleepMark.jitter.scale + 0.08));
+    }
+    if (todayMark) {
+      const ring = number.createSpan({ cls: "sr-calendar-sketch-ring sr-calendar-today-ring", attr: { "aria-hidden": "true" } });
+      for (let lineIndex = 0; lineIndex < 3; lineIndex += 1) {
+        const jitter = calendarMarkJitter(`${cell.date}-today-ring-line-${lineIndex}`);
+        const line = ring.createSpan();
+        line.style.setProperty("--ring-x", `${jitter.x + lineIndex - 1}px`);
+        line.style.setProperty("--ring-y", `${jitter.y + (lineIndex % 2 ? 1 : -2)}px`);
+        line.style.setProperty("--ring-rotate", `${jitter.rotate + (lineIndex - 1) * 8}deg`);
+        line.style.setProperty("--ring-scale", String(1.08 + (jitter.scale - 0.92) + lineIndex * 0.04));
+        line.style.setProperty("--ring-width", `${jitter.width + 18 + lineIndex * 3}px`);
+        line.style.setProperty("--ring-height", `${jitter.height + 14 + (lineIndex % 2) * 4}px`);
+        line.style.setProperty("--ring-radius", jitter.radius);
+      }
+    }
 
     const temporaryProjects = projects.filter((project) => project.type === "temporary" && projectOverlapsDate(project, cell.date));
     if (temporaryProjects.length > 0) {
@@ -4279,12 +4540,12 @@ function renderCalendarPanel(container, plugin, view) {
 
     if (shortTermProjects.length > 0) {
       const barsWrap = day.createDiv({ cls: "sr-calendar-bars" });
-      barsWrap.style.height = ((Math.max(...shortTermProjects.map((project) => laneMap.get(project.id) || 0)) + 1) * 18) + "px";
+      barsWrap.style.height = ((Math.max(...shortTermProjects.map((project) => laneMap.get(project.id) || 0)) + 1) * 10) + "px";
       for (const project of shortTermProjects) {
         const bar = barsWrap.createDiv({ cls: "sr-calendar-bar" });
         const hasRecord = entryDatesByProject.get(project.id)?.has(cell.date);
-        bar.style.top = ((laneMap.get(project.id) || 0) * 18) + "px";
-        bar.style.background = hasRecord ? project.color : rgba(project.color, 0.2);
+        bar.style.top = ((laneMap.get(project.id) || 0) * 10) + "px";
+        bar.style.background = hasRecord ? project.color : rgba(project.color, 0.38);
         bar.style.borderColor = rgba(project.color, hasRecord ? 0.92 : 0.36);
         bar.setAttr("title", project.name + " | " + projectScheduleLabel(project) + (hasRecord ? " | recorded" : " | planned"));
         const label = bar.createSpan({ cls: "sr-calendar-bar-label", text: calendarProjectMonogram(project.name) });
@@ -4376,7 +4637,7 @@ async function openCiteMemoryCard(plugin, card) {
   await plugin.app.workspace.getLeaf("tab").openFile(file);
 }
 
-function attachCiteCardPointerDrag(cardEl, card, zones, plugin) {
+function attachCiteCardPointerDrag(cardEl, card, zones, plugin, options = {}) {
   cardEl.draggable = false;
   let pointerId = null;
   let start = null;
@@ -4499,16 +4760,27 @@ function attachCiteCardPointerDrag(cardEl, card, zones, plugin) {
       event.stopPropagation();
       return;
     }
+    if (typeof options.onCardClick === "function") {
+      event.preventDefault();
+      event.stopPropagation();
+      options.onCardClick(card, cardEl);
+      return;
+    }
     void openCiteMemoryCard(plugin, card).catch((error) => new Notice(error instanceof Error ? error.message : "Failed to open card."));
   });
   cardEl.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
+    if (typeof options.onCardClick === "function") {
+      options.onCardClick(card, cardEl);
+      return;
+    }
     void openCiteMemoryCard(plugin, card).catch((error) => new Notice(error instanceof Error ? error.message : "Failed to open card."));
   });
 }
 
 function renderCiteMemoryPanel(container, plugin) {
+  const tablet = isTabletMode(plugin);
   const cards = listCiteMemoryCards(plugin);
   const dueCards = cards.filter((card) => card.due);
   const organizeNotes = listOrganizeNotes(plugin);
@@ -4531,7 +4803,40 @@ function renderCiteMemoryPanel(container, plugin) {
 
   if (dueCards.length > 0) {
     queue.addClass("is-hand");
+    if (tablet) body.addClass("is-tablet-review");
     const slots = body.createDiv({ cls: "sr-memory-slots" });
+    let selectedCard = null;
+    let selectedCardEl = null;
+    const selectCard = (card, element) => {
+      selectedCardEl?.removeClass("is-selected");
+      selectedCard = card;
+      selectedCardEl = element;
+      selectedCardEl.addClass("is-selected");
+      for (const zone of zones) {
+        zone.element.addClass("is-ready");
+        const hint = zone.element.querySelector("span:last-child");
+        if (hint) hint.textContent = "Tap to review";
+      }
+    };
+    const commitSelected = async (zone) => {
+      if (!tablet || !selectedCard) {
+        if (tablet) new Notice("Select a card first.");
+        return;
+      }
+      zone.element.addClass("is-active");
+      selectedCardEl?.addClass("is-committing");
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+      try {
+        await plugin.repository.reviewCiteCardAndPersist(selectedCard.path, zone.rating, todayYmd());
+        new Notice(`${selectedCard.title}: ${zone.label}`);
+        container.empty();
+        renderCiteMemoryPanel(container, plugin);
+      } catch (error) {
+        selectedCardEl?.removeClass("is-committing");
+        zone.element.removeClass("is-active");
+        new Notice(error instanceof Error ? error.message : "Failed to update card review.");
+      }
+    };
     const zoneDefinitions = [
       { rating: "remembered", label: "Remembered", icon: "check", color: "green" },
       { rating: "fuzzy", label: "Fuzzy", icon: "circle-help", color: "yellow" },
@@ -4541,13 +4846,23 @@ function renderCiteMemoryPanel(container, plugin) {
       const element = slots.createDiv({ cls: `sr-memory-slot is-${definition.color}` });
       setIcon(element.createSpan({ cls: "sr-memory-slot-icon" }), definition.icon);
       element.createEl("strong", { text: definition.label });
-      element.createSpan({ text: "Drop card" });
+      element.createSpan({ text: tablet ? "Tap card first" : "Drop card" });
+      if (tablet) {
+        element.setAttr("role", "button");
+        element.setAttr("tabindex", "0");
+        element.addEventListener("click", () => void commitSelected({ ...definition, element }));
+        element.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          void commitSelected({ ...definition, element });
+        });
+      }
       return { ...definition, element };
     });
 
     const handCenter = (dueCards.length - 1) / 2;
     for (const [index, card] of dueCards.entries()) {
-      const item = queue.createDiv({ cls: "sr-memory-card", attr: { tabindex: "0", role: "link", "aria-label": `Open ${card.title}` } });
+      const item = queue.createDiv({ cls: tablet ? "sr-memory-card is-tablet-card" : "sr-memory-card", attr: { tabindex: "0", role: tablet ? "button" : "link", "aria-label": tablet ? `Select ${card.title}` : `Open ${card.title}` } });
       item.style.setProperty("--memory-card-rotate", `${Math.max(-7, Math.min(7, (index - handCenter) * 1.7))}deg`);
       item.style.setProperty("--memory-card-lift", `${Math.min(7, Math.abs(index - handCenter) * 1.25)}px`);
       item.style.zIndex = String(index + 1);
@@ -4557,7 +4872,17 @@ function renderCiteMemoryPanel(container, plugin) {
       copy.createEl("strong", { text: card.title });
       copy.createSpan({ text: card.path });
       item.createSpan({ cls: "sr-memory-card-state", text: card.review ? `Due · ${card.review.reviewCount} reviews` : "New" });
-      attachCiteCardPointerDrag(item, card, zones, plugin);
+      if (tablet) {
+        const openButton = item.createEl("button", { cls: "sr-memory-card-open", attr: { type: "button", "aria-label": `Open ${card.title}` } });
+        setIcon(openButton, "external-link");
+        openButton.addEventListener("pointerdown", (event) => event.stopPropagation());
+        openButton.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void openCiteMemoryCard(plugin, card).catch((error) => new Notice(error instanceof Error ? error.message : "Failed to open card."));
+        });
+      }
+      attachCiteCardPointerDrag(item, card, zones, plugin, { onCardClick: tablet ? selectCard : null });
     }
   } else if (organizeNotes.length > 0) {
     body.addClass("is-organize");
@@ -6162,8 +6487,10 @@ class ProjectTimelineMatrixModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     this.modalEl?.addClass("sr-trend-matrix-modal-shell");
+    this.modalEl?.toggleClass("is-tablet-mode", isTabletMode(this.plugin));
     contentEl.empty();
     contentEl.addClass("sr-trend-matrix-modal");
+    contentEl.toggleClass("is-tablet-mode", isTabletMode(this.plugin));
     const header = contentEl.createDiv({ cls: "sr-matrix-header" });
     const title = header.createDiv();
     title.createEl("h2", { text: "Task Decomposition" });
@@ -6679,6 +7006,46 @@ class EntryModal extends Modal {
         input.addEventListener("input", updateScorePreview);
         updateScorePreview();
         inputs.set(field.id, input);
+      } else if (field.type === "emotion") {
+        const current = emotionValueParts(existing) || { pleasure: 3, energy: 3 };
+        const emotionWrap = row.createDiv({ cls: "sr-emotion-input" });
+        const plane = emotionWrap.createDiv({ cls: "sr-emotion-plane is-input" });
+        const dot = plane.createSpan({ cls: "sr-emotion-dot" });
+        const label = emotionWrap.createDiv({ cls: "sr-emotion-input-label" });
+        let emotion = { ...current };
+        const updateEmotionPreview = () => {
+          dot.style.left = `${(emotion.pleasure / 5) * 100}%`;
+          dot.style.top = `${100 - (emotion.energy / 5) * 100}%`;
+          dot.style.background = emotionColor(emotion);
+          label.setText(emotionStatusLabel(emotion));
+        };
+        const setEmotionFromPointer = (event) => {
+          const rect = plane.getBoundingClientRect();
+          const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+          const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / Math.max(1, rect.height)));
+          emotion = {
+            pleasure: Math.round(x * 10) / 2,
+            energy: Math.round((1 - y) * 10) / 2,
+          };
+          updateEmotionPreview();
+        };
+        plane.addEventListener("pointerdown", (event) => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          plane.setPointerCapture?.(event.pointerId);
+          setEmotionFromPointer(event);
+        });
+        plane.addEventListener("pointermove", (event) => {
+          if (!plane.hasPointerCapture?.(event.pointerId)) return;
+          event.preventDefault();
+          setEmotionFromPointer(event);
+        });
+        updateEmotionPreview();
+        inputs.set(field.id, {
+          get value() {
+            return { ...emotion };
+          },
+        });
       } else if (field.type === "time-range") {
         const input = row.createEl("input", { type: "hidden" });
         input.value = existing || "23:00-07:00";
@@ -6893,6 +7260,7 @@ class ReportSettingsModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.toggleClass("is-tablet-mode", isTabletMode(this.plugin));
     contentEl.createEl("h2", { text: "Report Settings" });
     contentEl.createDiv({ cls: "sr-muted", text: "DeepSeek API key is stored in Obsidian plugin data, not in reports or source code." });
     const form = contentEl.createDiv({ cls: "sr-form" });
@@ -6922,6 +7290,16 @@ class ReportSettingsModal extends Modal {
     petPromptInput.placeholder = DEFAULT_SETTINGS.petSystemPrompt;
     petPromptInput.value = this.plugin.settings.petSystemPrompt;
 
+    const tabletRow = form.createDiv({ cls: "sr-form-row" });
+    tabletRow.createEl("label", { text: "Tablet Mode" });
+    const tabletSelect = tabletRow.createEl("select");
+    [
+      ["auto", "Auto"],
+      ["on", "On"],
+      ["off", "Off"],
+    ].forEach(([value, label]) => tabletSelect.createEl("option", { value, text: label }));
+    tabletSelect.value = normalizeSettings(this.plugin.settings).tabletMode;
+
     const actions = form.createDiv({ cls: "sr-entry-actions" });
     actions.createEl("button", { text: "Cancel", type: "button" }).addEventListener("click", () => this.close());
     const saveButton = actions.createEl("button", { text: "Save", type: "button" });
@@ -6934,6 +7312,7 @@ class ReportSettingsModal extends Modal {
         ? Math.max(0, Math.min(8, Math.round(parsedMemoryCount)))
         : DEFAULT_SETTINGS.reportMemoryCount;
       this.plugin.settings.petSystemPrompt = petPromptInput.value.trim() || DEFAULT_SETTINGS.petSystemPrompt;
+      this.plugin.settings.tabletMode = ["auto", "on", "off"].includes(tabletSelect.value) ? tabletSelect.value : DEFAULT_SETTINGS.tabletMode;
       await this.plugin.saveSettings();
       new Notice("Report settings saved.");
       this.close();
@@ -7021,6 +7400,21 @@ class StructuredReviewSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Tablet Mode")
+      .setDesc("Auto detects touch devices. On enables touch-first card review, larger hit targets, and pet menu access without right-click.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("auto", "Auto")
+          .addOption("on", "On")
+          .addOption("off", "Off")
+          .setValue(normalizeSettings(this.plugin.settings).tabletMode)
+          .onChange(async (value) => {
+            this.plugin.settings.tabletMode = ["auto", "on", "off"].includes(value) ? value : DEFAULT_SETTINGS.tabletMode;
+            await this.plugin.saveSettings();
+            for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) leaf.view?.render?.();
+          });
+      });
   }
 }
 class StructuredReviewView extends ItemView {
@@ -7064,6 +7458,7 @@ class StructuredReviewView extends ItemView {
     this.deskPetCleanup = null;
     root.empty();
     root.addClass("structured-review-view");
+    root.toggleClass("is-tablet-mode", isTabletMode(this.plugin));
 
     const toolbar = root.createDiv({ cls: "sr-toolbar" });
     toolbar.createEl("button", { text: "Create Project" }).addEventListener("click", () => {
@@ -7131,11 +7526,138 @@ async function openStructuredReview(app, reveal) {
 }
 
 module.exports = class StructuredReviewPlugin extends Plugin {
+  citeReviewsPath() {
+    const pluginDir = this.manifest?.dir || `${this.app.vault.configDir || ".obsidian"}/plugins/${this.manifest?.id || "structured-review"}`;
+    return normalizePath(`${pluginDir}/${CITE_REVIEWS_FILE_NAME}`);
+  }
+
+  async ensureSyncFolder() {
+    const adapter = this.app.vault.adapter;
+    let current = "";
+    for (const part of SYNC_ROOT.split("/")) {
+      current = current ? `${current}/${part}` : part;
+      const normalized = normalizePath(current);
+      if (!(await adapter.exists(normalized))) await adapter.mkdir(normalized);
+    }
+  }
+
+  async readJsonFile(path) {
+    const normalized = normalizePath(path);
+    const adapter = this.app.vault.adapter;
+    const exists = await adapter.exists(normalized);
+    if (!exists) return { exists: false, data: null };
+    const raw = await adapter.read(normalized);
+    return { exists: true, data: JSON.parse(raw || "{}") };
+  }
+
+  async writeJsonFile(path, payload) {
+    await this.ensureSyncFolder();
+    await this.app.vault.adapter.write(normalizePath(path), `${JSON.stringify(payload, null, 2)}\n`);
+  }
+
+  async loadSyncMainData() {
+    try {
+      const result = await this.readJsonFile(SYNC_DATA_FILE);
+      if (!result.exists) return { exists: false, data: null };
+      return { exists: true, data: mainDataPayload(result.data, result.data?.settings) };
+    } catch (error) {
+      console.error("Structured Review: failed to load sync data mirror", error);
+      new Notice("Failed to load StructuredReview/sync/data.json. Falling back to plugin data.");
+      return { exists: false, data: null };
+    }
+  }
+
+  async loadSyncCiteReviewsData() {
+    try {
+      const result = await this.readJsonFile(SYNC_CITE_REVIEWS_FILE);
+      if (!result.exists) return { exists: false, citeReviews: [] };
+      const source = Array.isArray(result.data) ? result.data : result.data?.citeReviews;
+      return { exists: true, citeReviews: normalizeCiteReviews(source) };
+    } catch (error) {
+      console.error("Structured Review: failed to load sync cite reviews mirror", error);
+      new Notice("Failed to load StructuredReview/sync/cite-reviews.json. Falling back to local cite reviews.");
+      return { exists: false, citeReviews: [] };
+    }
+  }
+
+  async saveSyncMainData(data, settings) {
+    const payload = {
+      ...mainDataPayload(data, settings),
+      syncUpdatedAt: nowIso(),
+    };
+    await this.writeJsonFile(SYNC_DATA_FILE, payload);
+  }
+
+  async saveSyncCiteReviewsData(citeReviews) {
+    await this.writeJsonFile(SYNC_CITE_REVIEWS_FILE, {
+      version: 1,
+      syncUpdatedAt: nowIso(),
+      citeReviews: normalizeCiteReviews(citeReviews),
+    });
+  }
+
+  async saveSyncMirrorData(data, citeReviews, settings) {
+    try {
+      await this.saveSyncMainData(data, settings);
+      await this.saveSyncCiteReviewsData(citeReviews);
+    } catch (error) {
+      console.error("Structured Review: failed to save sync mirror", error);
+      new Notice("Structured Review saved locally, but sync mirror failed.");
+    }
+  }
+
+  async loadCiteReviewsData() {
+    const path = this.citeReviewsPath();
+    try {
+      const exists = await this.app.vault.adapter.exists(path);
+      if (!exists) return { exists: false, citeReviews: [] };
+      const raw = await this.app.vault.adapter.read(path);
+      const parsed = JSON.parse(raw || "{}");
+      const source = Array.isArray(parsed) ? parsed : parsed?.citeReviews;
+      return { exists: true, citeReviews: normalizeCiteReviews(source) };
+    } catch (error) {
+      console.error("Structured Review: failed to load cite reviews", error);
+      new Notice("Failed to load cite-reviews.json. Falling back to data.json.");
+      return { exists: false, citeReviews: [] };
+    }
+  }
+
+  async saveCiteReviewsData(citeReviews) {
+    const path = this.citeReviewsPath();
+    const payload = {
+      version: 1,
+      updatedAt: nowIso(),
+      citeReviews: normalizeCiteReviews(citeReviews),
+    };
+    await this.app.vault.adapter.write(path, `${JSON.stringify(payload, null, 2)}\n`);
+  }
+
   async onload() {
     const savedData = await this.loadData();
-    const source = savedData && typeof savedData === "object" ? savedData : DEFAULT_DATA;
+    const localSource = savedData && typeof savedData === "object" ? savedData : DEFAULT_DATA;
+    const syncMain = await this.loadSyncMainData();
+    const source = syncMain.exists ? syncMain.data : localSource;
+    const citeReviewFile = await this.loadCiteReviewsData();
+    const syncCiteReviewFile = await this.loadSyncCiteReviewsData();
+    const hasLegacyCiteReviews = Boolean(savedData && typeof savedData === "object" && Object.prototype.hasOwnProperty.call(savedData, "citeReviews"));
+    const legacyCiteReviews = normalizeCiteReviews(localSource.citeReviews || source.citeReviews);
+    const citeReviews = syncCiteReviewFile.exists
+      ? syncCiteReviewFile.citeReviews
+      : citeReviewFile.exists
+        ? citeReviewFile.citeReviews
+        : legacyCiteReviews;
     this.settings = normalizeSettings(source.settings);
-    this.repository = new Repository(this, { ...source, settings: this.settings });
+    applyTabletModeClass(this);
+    this.repository = new Repository(this, { ...source, citeReviews, settings: this.settings });
+    if (syncMain.exists) {
+      await this.saveData(mainDataPayload(this.repository.data, this.settings));
+    }
+    if (syncCiteReviewFile.exists) {
+      await this.saveCiteReviewsData(this.repository.data.citeReviews);
+    }
+    if (!syncMain.exists || !syncCiteReviewFile.exists || hasLegacyCiteReviews || (!citeReviewFile.exists && legacyCiteReviews.length > 0)) {
+      await this.saveRepositoryData(this.repository.data);
+    }
     this.reportService = new ReportService(this, this.repository);
     this.citeMemorySignature = citeMemoryCatalogSignature(this);
     this.citeMemoryDate = todayYmd();
@@ -7241,19 +7763,34 @@ module.exports = class StructuredReviewPlugin extends Plugin {
   async saveRepositoryData(data) {
     const settings = normalizeSettings(this.settings || data?.settings);
     this.settings = settings;
-    const payload = { ...data, settings };
+    applyTabletModeClass(this);
+    const payload = mainDataPayload(data, settings);
     if (this.repository) this.repository.data.settings = settings;
     await this.saveData(payload);
+    const citeReviews = data?.citeReviews || [];
+    await this.saveCiteReviewsData(citeReviews);
+    await this.saveSyncMirrorData(payload, citeReviews, settings);
   }
 
   async saveSettings() {
     this.settings = normalizeSettings(this.settings);
+    applyTabletModeClass(this);
     if (this.repository) {
       this.repository.data.settings = this.settings;
-      await this.saveData(this.repository.data);
+      const payload = mainDataPayload(this.repository.data, this.settings);
+      await this.saveData(payload);
+      await this.saveSyncMainData(payload, this.settings).catch((error) => {
+        console.error("Structured Review: failed to save sync settings mirror", error);
+        new Notice("Settings saved locally, but sync mirror failed.");
+      });
       return;
     }
-    await this.saveData({ ...DEFAULT_DATA, settings: this.settings });
+    const payload = mainDataPayload(DEFAULT_DATA, this.settings);
+    await this.saveData(payload);
+    await this.saveSyncMainData(payload, this.settings).catch((error) => {
+      console.error("Structured Review: failed to save sync settings mirror", error);
+      new Notice("Settings saved locally, but sync mirror failed.");
+    });
   }
 
   async generateReportWithNotice(kind) {
@@ -7307,6 +7844,7 @@ module.exports = class StructuredReviewPlugin extends Plugin {
       this.globalDeskPetCleanup();
       this.globalDeskPetCleanup = null;
     }
+    document.body.classList.remove("sr-tablet-mode");
     await this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 };
