@@ -2032,17 +2032,26 @@ function renderDeskPet(root, plugin) {
     walkC: getPluginAssetUrl(plugin, "deskpet-walk-c.png"),
     walkD: getPluginAssetUrl(plugin, "deskpet-walk-d.png"),
     read: getPluginAssetUrl(plugin, "deskpet-read.png"),
+    readStart: getPluginAssetUrl(plugin, "deskpet-read-start.png"),
     readPageA: getPluginAssetUrl(plugin, "deskpet-read-page-a.png"),
     readPageB: getPluginAssetUrl(plugin, "deskpet-read-page-b.png"),
+    readEnd: getPluginAssetUrl(plugin, "deskpet-read-end.png"),
     game: getPluginAssetUrl(plugin, "deskpet-game.png"),
+    gameStart: getPluginAssetUrl(plugin, "deskpet-game-start.png"),
     gameA: getPluginAssetUrl(plugin, "deskpet-game-a.png"),
     gameB: getPluginAssetUrl(plugin, "deskpet-game-b.png"),
+    gameEnd: getPluginAssetUrl(plugin, "deskpet-game-end.png"),
+    catStart: getPluginAssetUrl(plugin, "deskpet-cat-start.png"),
+    catPetA: getPluginAssetUrl(plugin, "deskpet-cat-pet-1.png"),
+    catPetB: getPluginAssetUrl(plugin, "deskpet-cat-pet-2.png"),
+    catPetC: getPluginAssetUrl(plugin, "deskpet-cat-pet-3.png"),
+    catEnd: getPluginAssetUrl(plugin, "deskpet-cat-end.png"),
     sleep: getPluginAssetUrl(plugin, "deskpet-sleep.png"),
     sleepA: getPluginAssetUrl(plugin, "deskpet-sleep-a.png"),
     sleepB: getPluginAssetUrl(plugin, "deskpet-sleep-b.png"),
-    held: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
-    heldA: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
-    heldB: getPluginAssetUrl(plugin, "deskpet-held-b.png"),
+    held: getPluginAssetUrl(plugin, "deskpet-held.png"),
+    heldA: getPluginAssetUrl(plugin, "deskpet-held.png"),
+    heldB: getPluginAssetUrl(plugin, "deskpet-held.png"),
   };
   const pet = root.createDiv({ cls: "sr-deskpet" });
   const img = pet.createEl("img", {
@@ -2496,17 +2505,26 @@ function renderDeskPetPlatform(root, plugin) {
     walkC: getPluginAssetUrl(plugin, "deskpet-walk-c.png"),
     walkD: getPluginAssetUrl(plugin, "deskpet-walk-d.png"),
     read: getPluginAssetUrl(plugin, "deskpet-read.png"),
+    readStart: getPluginAssetUrl(plugin, "deskpet-read-start.png"),
     readPageA: getPluginAssetUrl(plugin, "deskpet-read-page-a.png"),
     readPageB: getPluginAssetUrl(plugin, "deskpet-read-page-b.png"),
+    readEnd: getPluginAssetUrl(plugin, "deskpet-read-end.png"),
     game: getPluginAssetUrl(plugin, "deskpet-game.png"),
+    gameStart: getPluginAssetUrl(plugin, "deskpet-game-start.png"),
     gameA: getPluginAssetUrl(plugin, "deskpet-game-a.png"),
     gameB: getPluginAssetUrl(plugin, "deskpet-game-b.png"),
+    gameEnd: getPluginAssetUrl(plugin, "deskpet-game-end.png"),
+    catStart: getPluginAssetUrl(plugin, "deskpet-cat-start.png"),
+    catPetA: getPluginAssetUrl(plugin, "deskpet-cat-pet-1.png"),
+    catPetB: getPluginAssetUrl(plugin, "deskpet-cat-pet-2.png"),
+    catPetC: getPluginAssetUrl(plugin, "deskpet-cat-pet-3.png"),
+    catEnd: getPluginAssetUrl(plugin, "deskpet-cat-end.png"),
     sleep: getPluginAssetUrl(plugin, "deskpet-sleep.png"),
     sleepA: getPluginAssetUrl(plugin, "deskpet-sleep-a.png"),
     sleepB: getPluginAssetUrl(plugin, "deskpet-sleep-b.png"),
-    held: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
-    heldA: getPluginAssetUrl(plugin, "deskpet-held-a.png"),
-    heldB: getPluginAssetUrl(plugin, "deskpet-held-b.png"),
+    held: getPluginAssetUrl(plugin, "deskpet-held.png"),
+    heldA: getPluginAssetUrl(plugin, "deskpet-held.png"),
+    heldB: getPluginAssetUrl(plugin, "deskpet-held.png"),
   };
   for (const source of new Set(Object.values(sprites))) {
     const preload = new Image();
@@ -2534,6 +2552,7 @@ function renderDeskPetPlatform(root, plugin) {
   let action = "move";
   let idleAction = "read";
   let idleUntil = 0;
+  let idleSequence = null;
   let settleUntil = 0;
   let settleMoveType = "walk";
   let freeTargetNodeId = null;
@@ -2603,6 +2622,53 @@ function renderDeskPetPlatform(root, plugin) {
     pet.dataset.poseFrame = String(Math.max(0, Math.min(5, poseFrame)));
   };
   const readFrameSprite = (frameIndex) => ["read", "read", "readPageA", "readPageB", "read", "read"][frameIndex] || "read";
+  const idleSequences = {
+    read: { start: "readStart", middle: ["read", "readPageA", "readPageB"], end: "readEnd", frameMs: 430 },
+    game: { start: "gameStart", middle: ["game", "gameA", "gameB"], end: "gameEnd", frameMs: 390 },
+    cat: { start: "catStart", middle: ["catPetA", "catPetB", "catPetC"], end: "catEnd", frameMs: 420 },
+  };
+  const createIdleSequence = (key, now) => {
+    const definition = idleSequences[key];
+    if (!definition) return null;
+    const loops = 4 + Math.floor(Math.random() * 4);
+    const middleFrames = [];
+    let previous = "";
+    for (let index = 0; index < loops * 3; index += 1) {
+      let next = definition.middle[Math.floor(Math.random() * definition.middle.length)] || definition.middle[0];
+      if (definition.middle.length > 1 && next === previous) {
+        next = definition.middle[(definition.middle.indexOf(next) + 1 + Math.floor(Math.random() * (definition.middle.length - 1))) % definition.middle.length];
+      }
+      middleFrames.push(next);
+      previous = next;
+    }
+    const startMs = 2000;
+    const endMs = 2000;
+    const middleMs = middleFrames.length * definition.frameMs;
+    return {
+      key,
+      startedAt: now,
+      startMs,
+      endMs,
+      frameMs: definition.frameMs,
+      middleFrames,
+      startSprite: definition.start,
+      endSprite: definition.end,
+      totalMs: startMs + middleMs + endMs,
+    };
+  };
+  const idleSequencePose = (now) => {
+    if (!idleSequence) return null;
+    const elapsed = Math.max(0, now - idleSequence.startedAt);
+    if (elapsed < idleSequence.startMs) return { sprite: idleSequence.startSprite, frame: 0 };
+    const middleElapsed = elapsed - idleSequence.startMs;
+    const middleMs = idleSequence.middleFrames.length * idleSequence.frameMs;
+    if (middleElapsed >= middleMs) return { sprite: idleSequence.endSprite, frame: 5 };
+    const frame = Math.floor(middleElapsed / idleSequence.frameMs);
+    return {
+      sprite: idleSequence.middleFrames[frame] || idleSequence.middleFrames[0] || idleSequence.endSprite,
+      frame: frame % 6,
+    };
+  };
   const applyPetTransform = () => {
     pet.style.transform = `translate3d(${x}px, ${y}px, 0)`;
   };
@@ -3264,9 +3330,12 @@ function renderDeskPetPlatform(root, plugin) {
     }
   };
   const startIdle = (now) => {
-    const choices = ["read", "game", "sleep"];
+    const choices = ["read", "game", "sleep", "cat"];
     idleAction = choices[Math.floor(Math.random() * choices.length)] || "read";
-    idleUntil = now + (idleAction === "sleep" ? 7600 + Math.random() * 3200 : 4800 + Math.random() * 2200);
+    idleSequence = createIdleSequence(idleAction, now);
+    idleUntil = idleSequence
+      ? now + idleSequence.totalMs
+      : now + (idleAction === "sleep" ? 7600 + Math.random() * 3200 : 4800 + Math.random() * 2200);
     action = "idle";
   };
   const playSettle = (now) => {
@@ -3283,6 +3352,7 @@ function renderDeskPetPlatform(root, plugin) {
   const startMove = (from, to, edge, now) => {
     direction = to.x >= from.x ? 1 : -1;
     action = edge.type;
+    idleSequence = null;
     const moveDistance = distance(from, to);
     activeMove = {
       start: now,
@@ -3377,6 +3447,7 @@ function renderDeskPetPlatform(root, plugin) {
       return;
     }
     const type = moveDistance < config.anchorWalkDistance ? "walk" : "jump";
+    idleSequence = null;
     anchorMove = {
       start: now,
       duration: type === "walk" ? Math.max(220, (moveDistance / 150) * 1000) : 420,
@@ -3463,7 +3534,7 @@ function renderDeskPetPlatform(root, plugin) {
     x = clamp(point.x - dragOffset.x, 8, Math.max(8, bounds.width - petSize - 8));
     y = clamp(point.y - dragOffset.y, 24, Math.max(24, bounds.height - petSize - 8));
     const heldFrame = Math.floor(performance.now() / 170) % 6;
-    setImagePose(["heldA", "heldA", "heldB", "heldB", "heldA", "heldB"][heldFrame], direction, [0.8, 1.4, 1.8, 1.2, 0.4, 0][heldFrame], [-2.5, -1.2, 0.8, 2.5, 1.1, -0.8][heldFrame], heldFrame);
+    setImagePose("held", direction, [0.8, 1.4, 1.8, 1.2, 0.4, 0][heldFrame], [-2.5, -1.2, 0.8, 2.5, 1.1, -0.8][heldFrame], heldFrame);
     applyPetTransform();
   };
   const startPetDrag = () => {
@@ -3471,9 +3542,10 @@ function renderDeskPetPlatform(root, plugin) {
     isDraggingPet = true;
     activeMove = null;
     action = "drag";
+    idleSequence = null;
     dragOffset = { x: dragStartPoint.x - x, y: dragStartPoint.y - y };
     pet.addClass("is-dragging");
-    setImagePose("heldA", direction);
+    setImagePose("held", direction);
   };
   const finishPetDrag = (event) => {
     if (event.pointerId !== dragPointerId) return;
@@ -3558,7 +3630,7 @@ function renderDeskPetPlatform(root, plugin) {
     syncPetLayer();
     if (isDraggingPet) {
       const heldFrame = Math.floor(now / 170) % 6;
-      setImagePose(["heldA", "heldA", "heldB", "heldB", "heldA", "heldB"][heldFrame], direction, [0.8, 1.4, 1.8, 1.2, 0.4, 0][heldFrame], [-2.5, -1.2, 0.8, 2.5, 1.1, -0.8][heldFrame], heldFrame);
+      setImagePose("held", direction, [0.8, 1.4, 1.8, 1.2, 0.4, 0][heldFrame], [-2.5, -1.2, 0.8, 2.5, 1.1, -0.8][heldFrame], heldFrame);
       frame = requestAnimationFrame(tick);
       return;
     }
@@ -3618,12 +3690,9 @@ function renderDeskPetPlatform(root, plugin) {
         ? [0, -0.25, -0.55, -0.8, -0.55, -0.25][idleFrame]
         : [0, -0.6, -1.1, -1.4, -0.9, -0.35][idleFrame];
       const idleRotate = idleAction === "game" ? [-1, -0.4, 0.5, 1, 0.35, -0.45][idleFrame] : 0;
-      const idleSprite = idleAction === "read"
-        ? readFrameSprite(idleFrame)
-        : idleAction === "game"
-          ? ["game", "gameA", "gameA", "gameB", "gameB", "game"][idleFrame]
-          : ["sleep", "sleepA", "sleepA", "sleepB", "sleepB", "sleep"][idleFrame];
-      setImagePose(idleSprite, 1, idleLift, idleRotate, idleFrame);
+      const sequencedPose = idleSequencePose(now);
+      const idleSprite = sequencedPose?.sprite || ["sleep", "sleepA", "sleepA", "sleepB", "sleepB", "sleep"][idleFrame];
+      setImagePose(idleSprite, 1, idleLift, idleRotate, sequencedPose?.frame ?? idleFrame);
       applyPetTransform();
       frame = requestAnimationFrame(tick);
       return;
@@ -4637,6 +4706,112 @@ async function openCiteMemoryCard(plugin, card) {
   await plugin.app.workspace.getLeaf("tab").openFile(file);
 }
 
+function citeReviewMasteryPercent(review) {
+  if (!review) return 0;
+  const stage = Number(review.stage);
+  if (!Number.isFinite(stage) || stage < 0) return 0;
+  return Math.round(((Math.min(stage, CITE_REVIEW_INTERVALS.length - 1) + 1) / CITE_REVIEW_INTERVALS.length) * 100);
+}
+
+function citeReviewStageLabel(review) {
+  if (!review) return "New";
+  if (review.stage < 0) return "Learning";
+  return `Stage ${review.stage + 1}/${CITE_REVIEW_INTERVALS.length}`;
+}
+
+function citeReviewIntervalLabel(review) {
+  if (!review || review.stage < 0) return "1 day";
+  const days = CITE_REVIEW_INTERVALS[Math.min(review.stage, CITE_REVIEW_INTERVALS.length - 1)] || 1;
+  return days === 1 ? "1 day" : `${days} days`;
+}
+
+function citeRatingLabel(rating) {
+  if (rating === "remembered") return "Remembered";
+  if (rating === "fuzzy") return "Fuzzy";
+  if (rating === "forgotten") return "Forgotten";
+  return "-";
+}
+
+class CiteMemoryDetailModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl?.addClass("sr-memory-detail-modal-shell");
+    contentEl.empty();
+    contentEl.addClass("sr-memory-detail-modal");
+    const cards = listCiteMemoryCards(this.plugin);
+    const dueCards = cards.filter((card) => card.due);
+    const newCards = cards.filter((card) => !card.review);
+    const reviewedCards = cards.filter((card) => card.review);
+    const averageMastery = reviewedCards.length
+      ? Math.round(reviewedCards.reduce((sum, card) => sum + citeReviewMasteryPercent(card.review), 0) / reviewedCards.length)
+      : 0;
+
+    const header = contentEl.createDiv({ cls: "sr-memory-detail-header" });
+    const title = header.createDiv();
+    title.createEl("h2", { text: "Memory Cards" });
+    title.createDiv({ cls: "sr-muted", text: "Aed review schedule, mastery, and interval rules." });
+
+    const stats = contentEl.createDiv({ cls: "sr-memory-detail-stats" });
+    [
+      ["Cards", String(cards.length)],
+      ["Due today", String(dueCards.length)],
+      ["New", String(newCards.length)],
+      ["Avg mastery", `${averageMastery}%`],
+    ].forEach(([label, value]) => {
+      const item = stats.createDiv({ cls: "sr-memory-detail-stat" });
+      item.createSpan({ text: label });
+      item.createEl("strong", { text: value });
+    });
+
+    const rule = contentEl.createDiv({ cls: "sr-memory-detail-rule" });
+    rule.createEl("strong", { text: "Review logic" });
+    rule.createEl("p", {
+      text: `Intervals are ${CITE_REVIEW_INTERVALS.join(" → ")} days. Remembered moves a card one stage forward and schedules the next review by that stage interval. Fuzzy moves it one stage backward and reviews tomorrow. Forgotten resets it to Learning and reviews tomorrow. New cards are due immediately.`,
+    });
+
+    const tableWrap = contentEl.createDiv({ cls: "sr-memory-detail-table-wrap" });
+    const table = tableWrap.createEl("table", { cls: "sr-memory-detail-table" });
+    const thead = table.createEl("thead");
+    const headRow = thead.createEl("tr");
+    ["Card", "Next review", "Mastery", "Stage", "Last", "Reviews"].forEach((label) => headRow.createEl("th", { text: label }));
+    const tbody = table.createEl("tbody");
+    if (cards.length === 0) {
+      const row = tbody.createEl("tr");
+      const cell = row.createEl("td", { text: "No #Aed cards found." });
+      cell.colSpan = 6;
+    }
+    for (const card of cards) {
+      const row = tbody.createEl("tr");
+      if (card.due) row.addClass("is-due");
+      const titleCell = row.createEl("td");
+      const openButton = titleCell.createEl("button", { cls: "sr-memory-detail-open", attr: { type: "button" } });
+      openButton.createSpan({ text: card.title });
+      openButton.addEventListener("click", () => {
+        void openCiteMemoryCard(this.plugin, card).catch((error) => new Notice(error instanceof Error ? error.message : "Failed to open card."));
+      });
+      titleCell.createDiv({ cls: "sr-muted", text: card.path });
+      row.createEl("td", { text: card.review?.nextReview || "Now" });
+      const masteryCell = row.createEl("td");
+      const mastery = citeReviewMasteryPercent(card.review);
+      masteryCell.createSpan({ cls: "sr-memory-mastery-value", text: `${mastery}%` });
+      const bar = masteryCell.createDiv({ cls: "sr-memory-mastery-bar" });
+      bar.createSpan().style.width = `${mastery}%`;
+      row.createEl("td", { text: `${citeReviewStageLabel(card.review)} · ${citeReviewIntervalLabel(card.review)}` });
+      row.createEl("td", { text: card.review ? `${card.review.lastReview || "-"} · ${citeRatingLabel(card.review.lastRating)}` : "-" });
+      row.createEl("td", { text: String(card.review?.reviewCount || 0) });
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 function attachCiteCardPointerDrag(cardEl, card, zones, plugin, options = {}) {
   cardEl.draggable = false;
   let pointerId = null;
@@ -4789,7 +4964,11 @@ function renderCiteMemoryPanel(container, plugin) {
   const nextCard = cards.filter((card) => !card.due && card.review?.nextReview).sort((left, right) => left.review.nextReview.localeCompare(right.review.nextReview))[0];
   const head = container.createDiv({ cls: "sr-memory-head" });
   head.createEl("h3", { text: dueCards.length > 0 ? "Aed Review" : organizeNotes.length > 0 ? "Aing Notes" : "Daily Cards" });
-  head.createSpan({ text: `${dueCards.length} Aed · ${organizeNotes.length} Aing · ${tomorrowCount} tomorrow` });
+  const actions = head.createDiv({ cls: "sr-memory-head-actions" });
+  actions.createSpan({ text: `${dueCards.length} Aed · ${organizeNotes.length} Aing · ${tomorrowCount} tomorrow` });
+  const detailButton = actions.createEl("button", { cls: "sr-memory-detail-button", attr: { type: "button", "aria-label": "Memory card details" } });
+  setIcon(detailButton, "list-tree");
+  detailButton.addEventListener("click", () => new CiteMemoryDetailModal(plugin.app, plugin).open());
 
   const body = container.createDiv({ cls: "sr-memory-body" });
   const queue = body.createDiv({ cls: "sr-memory-queue" });
